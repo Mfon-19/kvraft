@@ -35,7 +35,7 @@ type Entry struct {
 	value     []byte
 }
 
-func (db *DB) Open(dirName string) (*DB, error) {
+func Open(dirName string) (*DB, error) {
 	// the directory for all the files to lie in
 	err := os.Mkdir(dirName, os.ModeDir)
 	if err != nil {
