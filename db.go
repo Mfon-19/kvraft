@@ -37,7 +37,7 @@ type Entry struct {
 
 func Open(dirName string) (*DB, error) {
 	// the directory for all the files to lie in
-	err := os.Mkdir(dirName, os.ModeDir)
+	err := os.MkdirAll(dirName, 0755)
 	if err != nil {
 		return nil, errors.New("an error occurred while creating directory")
 	}
@@ -49,12 +49,13 @@ func Open(dirName string) (*DB, error) {
 		path:       dirName,
 		activeFile: filePath,
 		keyDir:     make(map[string]KeyDirEntry),
+		mu:         &sync.RWMutex{},
 	}, nil
 }
 
 func (db *DB) Get(key string) ([]byte, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	// check if the key exists
 	entry, exists := db.keyDir[key]
 	if !exists {
@@ -65,6 +66,7 @@ func (db *DB) Get(key string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("failed to open file for reading")
 	}
+	defer file.Close()
 
 	// read len(crc) + entrySize bytes from the offset specified in the keyDir map
 	_, err = file.Seek(int64(entry.filePos), io.SeekStart)
@@ -129,8 +131,7 @@ func (db *DB) Get(key string) ([]byte, error) {
 		return nil, errors.New("crc values do not match. the data is corrupted")
 	}
 
-	_ = file.Close()
-
+	db.mu.RLock()
 	return value, nil
 }
 
@@ -138,11 +139,11 @@ func (db *DB) Put(key string, value string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	file, err := os.OpenFile(db.activeFile, os.O_APPEND, 0644)
+	file, err := os.OpenFile(db.activeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return errors.New("an error occurred while opening file for append")
 	}
-	_ = file.Close()
+	defer file.Close()
 
 	info, _ := file.Stat()
 	offSet := info.Size()

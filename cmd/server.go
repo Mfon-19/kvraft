@@ -2,13 +2,16 @@ package main
 
 import (
 	"fmt"
-	DB "kvraft"
+	"kvraft"
+	"log"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 )
 
 func main() {
-	listener, err := net.Listen("tcp", "localhost:8080")
+	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		fmt.Println("error starting server: ", err)
 		return
@@ -24,11 +27,11 @@ func main() {
 
 	fmt.Println("client connected on: ", conn.RemoteAddr())
 
-	connections := make(map[string]*DB)
-
+	connections := make(map[string]*kvraft.DB)
+	l := log.New(os.Stdout, "[SERVER] - ", log.Ltime)
 	// this assumes no errors in input
 	for {
-		message := make([]byte, 0)
+		message := make([]byte, 1024)
 		n, err := conn.Read(message)
 		if err != nil {
 			_, err := conn.Write([]byte("error reading message from client"))
@@ -40,21 +43,23 @@ func main() {
 			continue
 		}
 
-		parts := strings.Fields(string(message))
+		l.Printf("received command from client: %s\n", string(message))
+
+		parts := strings.Fields(string(message[:n]))
 		command := parts[0]
 		args := parts[1:]
 
 		switch command {
 		case "open":
 			dirName := args[0]
-			idx := len(connections)
+			idx := len(connections) + 1
 
 			// the handle is just a concatenation of directory name and
 			// the number of connections the server is currently handling
-			dbHandle := dirName + string(rune(idx))
+			dbHandle := dirName + strconv.Itoa(idx)
 
 			// open a database
-			db, err := Open(dirName)
+			db, err := kvraft.Open(dirName)
 			if err != nil {
 				response := "failed to open database: " + err.Error()
 				_, err := conn.Write([]byte(response))
