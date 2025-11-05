@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,6 +18,7 @@ type DB struct {
 	activeFile string
 	keyDir     map[string]KeyDirEntry
 	mu         *sync.RWMutex
+	lg         *log.Logger
 }
 
 type KeyDirEntry struct {
@@ -44,12 +46,14 @@ func Open(dirName string) (*DB, error) {
 
 	// use name 'file1' for the first file because the name is irrelevant (I think)
 	filePath := filepath.Join(dirName, "file1")
+	lg := log.New(os.Stdout, "[DB] - ", log.Ltime)
 
 	return &DB{
 		path:       dirName,
 		activeFile: filePath,
 		keyDir:     make(map[string]KeyDirEntry),
 		mu:         &sync.RWMutex{},
+		lg:         lg,
 	}, nil
 }
 
