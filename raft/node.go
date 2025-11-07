@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"context"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -35,11 +37,12 @@ type Node struct {
 	electionTimer *time.Timer
 
 	rpcHandler RPCHandler
+	rpcTimeout time.Duration
 }
 
 type RPCHandler interface {
-	RequestVote(target string, args *RequestVoteArgs, reply *RequestVoteReply) error
-	AppendEntries(target string, args *AppendEntriesArgs, reply *AppendEntriesReply) error
+	RequestVote(ctx context.Context, target string, args *RequestVoteArgs, reply *RequestVoteReply) error
+	AppendEntries(ctx context.Context, target string, args *AppendEntriesArgs, reply *AppendEntriesReply) error
 }
 
 func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandler) *Node {
@@ -83,6 +86,125 @@ func (n *Node) runFollower() {
 		n.mu.Unlock()
 	case <-n.shutdownCh:
 		return
+	}
+}
+
+func (n *Node) runCandidate() {
+	n.mu.Lock()
+
+	// prerequisites for a new candidate.
+	// increase current term, vote for self
+	n.currentTerm++
+	n.votedFor = n.id
+	currentTerm := n.currentTerm
+	lastLogIndex := len(n.log) - 1
+	lastLogTerm := n.log[lastLogIndex].Term
+	n.mu.Unlock()
+
+	log.Printf("[Node %d] Starting election for term %d", n.id, currentTerm)
+
+	votes := 1
+	// needs a majority vote
+	votesNeeded := (len(n.peers)+1)/2 + 1
+
+	replies := make([]RequestVoteReply, len(n.peers))
+	args := &RequestVoteArgs{
+		Term:         currentTerm,
+		CandidateId:  n.id,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+
+	var wg sync.WaitGroup
+	for i, peer := range n.peers {
+		if i == n.id {
+			continue
+		}
+
+		wg.Add(1)
+		go func(peerAddr string, index int) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), n.rpcTimeout)
+			defer cancel()
+
+			err := n.rpcHandler.RequestVote(ctx, peerAddr, args, &replies[index])
+			if err != nil {
+				log.Printf("[Node %d] Error requesting vote from %s", n.id, peerAddr)
+				return
+			}
+		}(peer, i)
+	}
+
+	wg.Wait()
+	for i, r := range replies {
+		if i == n.id {
+			continue
+		}
+
+		// if we find a peer with a higher term,
+		// revert back to follower
+		if r.Term > currentTerm {
+			n.mu.Lock()
+			n.currentTerm = r.Term
+			n.votedFor = -1
+			n.mu.Unlock()
+			n.state = Follower
+			// n.runFollower()
+			return
+		}
+
+		if n.state != Candidate || n.currentTerm != currentTerm {
+			return
+		}
+
+		if r.VoteGranted {
+			votes++
+		}
+
+		if votes >= votesNeeded {
+			n.state = Leader
+			// runLeader
+		}
+
+		n.resetElectionTimer()
+
+		select {
+		case <-n.electionTimer.C:
+		// jitter + exponential backoff + run new election
+		case <-n.heartbeatCh:
+			// received AppendEntries from leader
+			n.mu.Lock()
+			n.state = Follower
+			n.mu.Unlock()
+		case <-n.shutdownCh:
+			return
+		}
+	}
+}
+
+func (n *Node) tryAdvanceCommitIndex() {
+	for N := len(n.log) - 1; N > n.commitIndex; N-- {
+		if n.log[N].Term != n.currentTerm {
+			continue
+		}
+
+		// count self
+		count := 1
+		for i := range n.peers {
+			if i == n.id {
+				continue
+			}
+			if n.matchIndex[i] >= N {
+				count++
+			}
+		}
+
+		if count > len(n.peers)/2 {
+			n.commitIndex = N
+			log.Printf("[Node %d] Advanced commitIndex to %d", n.id, n.commitIndex)
+			break
+		}
 	}
 }
 
