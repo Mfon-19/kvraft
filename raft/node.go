@@ -164,7 +164,8 @@ func (n *Node) runCandidate() {
 
 		if votes >= votesNeeded {
 			n.state = Leader
-			// runLeader
+			n.becomeLeader()
+			log.Printf("[Node %d] Won election for term %d", n.id, currentTerm)
 		}
 
 		n.resetElectionTimer()
@@ -180,6 +181,33 @@ func (n *Node) runCandidate() {
 		case <-n.shutdownCh:
 			return
 		}
+	}
+}
+
+func (n *Node) becomeLeader() {
+	n.nextIndex = make(map[int]int)
+	n.matchIndex = make(map[int]int)
+
+	lastLogIndex := len(n.log) - 1
+	for i := range n.peers {
+		n.nextIndex[i] = lastLogIndex + 1
+		n.matchIndex[i] = 0
+	}
+
+	go n.sendHeartbeats()
+}
+
+func (n *Node) runLeader() {
+	ticker := time.NewTicker(HeartbeatInterval)
+	defer ticker.Stop()
+
+	go n.applyCommittedEntries()
+
+	select {
+	case <-ticker.C:
+		n.sendHeartbeats()
+	case <-n.shutdownCh:
+		return
 	}
 }
 
@@ -204,6 +232,25 @@ func (n *Node) tryAdvanceCommitIndex() {
 			n.commitIndex = N
 			log.Printf("[Node %d] Advanced commitIndex to %d", n.id, n.commitIndex)
 			break
+		}
+	}
+}
+
+func (n *Node) applyCommittedEntries() {
+	for {
+		n.mu.Lock()
+		if n.lastApplied < n.commitIndex {
+			n.lastApplied++
+			entry := n.log[n.lastApplied]
+			n.mu.Unlock()
+
+			n.applyCh <- ApplyMsg{
+				Index:   entry.Index,
+				Command: entry.Command,
+			}
+		} else {
+			n.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
