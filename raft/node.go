@@ -208,6 +208,126 @@ func (n *Node) tryAdvanceCommitIndex() {
 	}
 }
 
+func (n *Node) sendHeartbeats() {
+	n.mu.RLock()
+	// can't send heartbeats if node isn't leader
+	if n.state != Leader {
+		n.mu.RUnlock()
+		return
+	}
+
+	currentTerm := n.currentTerm
+	leaderId := n.id
+	commitIndex := n.commitIndex
+	n.mu.RUnlock()
+
+	replies := make([]AppendEntriesReply, len(n.peers))
+
+	var wg sync.WaitGroup
+	for i, peer := range n.peers {
+		if i == n.id {
+			continue
+		}
+
+		// a goroutine for each peer. this also guarantees the log matching property
+		wg.Add(1)
+		go func(peerIdx int, peerAddr string) {
+			defer wg.Done()
+
+			backoff := 10 * time.Millisecond
+			for {
+				n.mu.RLock()
+				if n.state != Leader || n.currentTerm != currentTerm {
+					n.mu.RUnlock()
+					return
+				}
+				nextIndex := n.nextIndex[peerIdx]
+
+				prevLogIndex := nextIndex - 1
+				var prevLogTerm int
+				if prevLogIndex >= 0 && prevLogIndex < len(n.log) {
+					prevLogTerm = n.log[prevLogIndex].Term
+				} else {
+					prevLogTerm = 0
+					if prevLogIndex < 0 {
+						prevLogIndex = -1
+					}
+				}
+
+				// get log entries to send
+				var entries []LogEntry
+				if nextIndex >= 0 && nextIndex < len(n.log) {
+					entries = append([]LogEntry(nil), n.log[nextIndex:]...)
+				}
+				n.mu.RUnlock()
+
+				args := &AppendEntriesArgs{
+					Term:         currentTerm,
+					LeaderId:     leaderId,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: commitIndex,
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), n.rpcTimeout)
+				var reply AppendEntriesReply
+				err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &replies[peerIdx])
+				cancel()
+				if err != nil {
+					time.Sleep(backoff)
+					// exponential backoff
+					if backoff < 500*time.Millisecond {
+						backoff *= 2
+					}
+					log.Printf("[Node %d] AppendEntries rpc to %s failed", n.id, peerAddr)
+					continue
+				}
+
+				// if higher term discovered, step down
+				if reply.Term > currentTerm {
+					n.mu.Lock()
+					if reply.Term > n.currentTerm {
+						n.currentTerm = reply.Term
+						n.votedFor = -1
+						n.state = Follower
+					}
+					n.mu.Unlock()
+					return
+				}
+
+				if reply.Success {
+					n.mu.Lock()
+
+					match := prevLogIndex + len(entries)
+					if match < 0 {
+						match = prevLogIndex
+					}
+					// update the matchIndex and nextIndex for this peer
+					n.matchIndex[peerIdx] = max(n.matchIndex[peerIdx], match)
+					n.nextIndex[peerIdx] = n.matchIndex[peerIdx] + 1
+
+					// advance the commit index
+					n.tryAdvanceCommitIndex()
+					n.mu.Unlock()
+					return
+				}
+
+				// here, the log matching property is implemented. we don't use accelerated
+				// backtracking, so this will be O(n) in the worst case which is fine
+				n.mu.Lock()
+				if n.nextIndex[peerIdx] > 1 {
+					n.nextIndex[peerIdx]--
+				}
+				n.mu.Unlock()
+			}
+
+		}(i, peer)
+	}
+
+	wg.Wait()
+}
+
 func (n *Node) resetElectionTimer() {
 	timeout := ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
 
