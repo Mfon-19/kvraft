@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"kvraft"
+	"kvraft/kvstore"
 	"log"
 	"net"
 	"os"
@@ -27,7 +27,7 @@ func main() {
 
 	fmt.Println("client connected on: ", conn.RemoteAddr())
 
-	connections := make(map[string]*kvraft.DB)
+	connections := make(map[string]*kvstore.DB)
 	l := log.New(os.Stdout, "[SERVER] - ", log.Ltime)
 	// this assumes no errors in input
 	for {
@@ -59,7 +59,7 @@ func main() {
 			dbHandle := dirName + strconv.Itoa(idx)
 
 			// open a database
-			db, err := kvraft.Open(dirName)
+			db, err := kvstore.Open(dirName)
 			if err != nil {
 				response := "failed to open database: " + err.Error()
 				_, err := conn.Write([]byte(response))

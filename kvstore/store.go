@@ -1,4 +1,4 @@
-package kvraft
+package kvstore
 
 import (
 	"bytes"
@@ -193,4 +193,19 @@ func (db *DB) Put(key string, value string) error {
 	}
 
 	return nil
+}
+
+func (db *DB) Delete(key string) error {
+	return nil
+}
+
+func (db *DB) Keys() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	keys := make([]string, 0, len(db.keyDir))
+	for key := range db.keyDir {
+		keys = append(keys, key)
+	}
+	return keys
 }
