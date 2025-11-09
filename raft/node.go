@@ -71,6 +71,27 @@ func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandle
 
 func (n *Node) run() {
 	n.resetElectionTimer()
+
+	for {
+		select {
+		case <-n.shutdownCh:
+			return
+		default:
+		}
+
+		n.mu.RLock()
+		state := n.state
+		n.mu.RUnlock()
+
+		switch state {
+		case Follower:
+			n.runFollower()
+		case Leader:
+			n.runLeader()
+		case Candidate:
+			n.runCandidate()
+		}
+	}
 }
 
 func (n *Node) runFollower() {
@@ -142,13 +163,12 @@ func (n *Node) runCandidate() {
 			continue
 		}
 
+		n.mu.Lock()
 		// if we find a peer with a higher term,
 		// revert back to follower
 		if r.Term > currentTerm {
-			n.mu.Lock()
 			n.currentTerm = r.Term
 			n.votedFor = -1
-			n.mu.Unlock()
 			n.state = Follower
 			// n.runFollower()
 			return
@@ -167,6 +187,7 @@ func (n *Node) runCandidate() {
 			n.becomeLeader()
 			log.Printf("[Node %d] Won election for term %d", n.id, currentTerm)
 		}
+		n.mu.Unlock()
 
 		n.resetElectionTimer()
 
@@ -384,4 +405,124 @@ func (n *Node) resetElectionTimer() {
 		n.electionTimer.Stop()
 		n.electionTimer.Reset(timeout)
 	}
+}
+
+func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	reply.Term = n.currentTerm
+	reply.VoteGranted = false
+
+	// don't grant vote if you have a higher term
+	if n.currentTerm > args.Term {
+		return
+	}
+
+	// update term if necessary
+	if args.Term > n.currentTerm {
+		n.currentTerm = args.Term
+		n.votedFor = -1
+		n.state = Follower
+	}
+
+	lastLogIndex := len(n.log) - 1
+	lastLogTerm := n.log[lastLogIndex].Term
+
+	// candidates log term must be at least as high as mine, and if equal their log
+	// must be at least as up to date as mine
+	logOk := (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+
+	if (n.votedFor == -1 || n.votedFor == args.CandidateId) && logOk {
+		n.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		n.voteCh <- true
+	}
+}
+
+func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	reply.Term = n.currentTerm
+	reply.Success = false
+
+	// reject AppendEntries if leader term is not up to mine
+	if n.currentTerm > args.Term {
+		return
+	}
+
+	// update term if necessary
+	if args.Term > n.currentTerm {
+		n.currentTerm = args.Term
+		n.state = Follower
+		n.votedFor = -1
+	}
+
+	n.heartbeatCh <- true
+
+	// if our logs don't match, tell the leader
+	if args.PrevLogIndex >= len(n.log) || n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	// append the entries to my log
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + i + 1
+		if idx < len(n.log) {
+			// if this entry is meant to match with the leader, discard faulty entries and append
+			if n.log[idx].Term != entry.Term {
+				n.log = n.log[:idx]
+				n.log = append(n.log, entry)
+			}
+		} else {
+			n.log = append(n.log, entry)
+		}
+	}
+
+	// update commit index
+	if args.LeaderCommit > n.commitIndex {
+		n.commitIndex = min(args.LeaderCommit, len(n.log)-1)
+	}
+
+	// successfully appended
+	reply.Success = true
+}
+
+func (n *Node) Submit(cmd Command) (int, int, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// can only submit to the leader
+	if n.state != Leader {
+		return -1, -1, false
+	}
+
+	// add this entry to our raft log
+	index := len(n.log)
+	entry := LogEntry{
+		Term:    n.currentTerm,
+		Index:   index,
+		Command: cmd,
+	}
+	n.log = append(n.log, entry)
+
+	log.Printf("[Node %d] Appended entry at %d: %+v", n.id, index, cmd)
+	return index, n.currentTerm, true
+}
+
+func (n *Node) IsLeader() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.state == Leader
+}
+
+func (n *Node) GetState() (int, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.currentTerm, n.state == Leader
+}
+
+func (n *Node) Shutdown() {
+	close(n.shutdownCh)
 }
