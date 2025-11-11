@@ -1,4 +1,4 @@
-package kvraft
+package server
 
 import (
 	"context"
@@ -43,6 +43,32 @@ func NewRaftKVServer(id int, address string, peers []string) *RaftKVServer {
 	s.raftNode = raft.NewNode(id, peers, applyCh, rpcHandler)
 
 	go s.applyCommittedEntries(applyCh)
+	return nil
+}
+
+func (s *RaftKVServer) Start() error {
+	// register rpc service
+	s.rpcServer = rpc.NewServer()
+	s.rpcServer.RegisterName("Raft", &RaftRPC{server: s})
+
+	listener, err := net.Listen("tcp", s.address)
+	if err != nil {
+		return err
+	}
+	s.listener = listener
+
+	log.Printf("[Server %d] Listening on %s", s.id, s.address)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go s.rpcServer.ServeConn(conn)
+		}
+	}()
+
 	return nil
 }
 
