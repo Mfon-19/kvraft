@@ -1,8 +1,10 @@
 package raft
 
-import "time"
+import (
+	"time"
+	pb "kvraft/proto"
+)
 
-// RequestVote rpc
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -15,7 +17,6 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntries rpc
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
