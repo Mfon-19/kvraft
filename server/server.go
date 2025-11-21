@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/grpc"
 	"kvraft/kvstore"
+	pb "kvraft/proto"
 	"kvraft/raft"
 	"log"
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 )
 
 type RaftKVServer struct {
@@ -19,7 +22,7 @@ type RaftKVServer struct {
 	address     string
 	raftNode    *raft.Node
 	store       *kvstore.DB
-	rpcServer   *rpc.Server
+	grpcServer  *grpc.Server
 	listener    net.Listener
 	pending     map[int]chan string
 	pendingLock sync.Mutex
@@ -177,44 +180,93 @@ func (s *RaftKVServer) Close() {
 	}
 }
 
-type RaftRPC struct {
+type GRPCRaftService struct {
+	pb.UnimplementedRaftServiceServer
 	server *RaftKVServer
 }
 
-func (r *RaftRPC) RequestVote(args *raft.RequestVoteArgs, reply *raft.RequestVoteReply) error {
-	r.server.raftNode.HandleRequestVote(args, reply)
-	return nil
+func (g *GRPCRaftService) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	args := raft.RequestVoteArgsFromProto(req)
+	reply := &raft.RequestVoteReply{}
+	g.server.raftNode.HandleRequestVote(args, reply)
+	return raft.RequestVoteReplyToProto(reply), nil
 }
 
-func (r *RaftRPC) AppendEntries(args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply) error {
-	r.server.raftNode.HandleAppendEntries(args, reply)
-	return nil
+func (g *GRPCRaftService) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	args := raft.AppendEntriesArgsFromProto(req)
+	reply := &raft.AppendEntriesReply{}
+	g.server.raftNode.HandleAppendEntries(args, reply)
+	return raft.AppendEntriesReplyToProto(reply), nil
 }
 
-type RPCClient struct {
+type GRPCClient struct {
 	peers []string
+	conns map[string]*grpc.ClientConn
+	mu    sync.Mutex
 }
 
-func (c *RPCClient) RequestVote(ctx context.Context, target string, args *raft.RequestVoteArgs, reply *raft.RequestVoteReply) error {
-	client, err := rpc.Dial("tcp", target)
-	if err != nil {
-		log.Printf("[RPCClient] Error dialing server %s", target)
-		return err
-	}
-	defer client.Close()
+func (c *GRPCClient) getConnection(target string) (*grpc.ClientConn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	return client.Call("Raft.AppendEntries", args, reply)
+	if c.conns == nil {
+		c.conns = make(map[string]*grpc.ClientConn)
+	}
+
+	// if already connected, return connection
+	if conn, ok := c.conns[target]; ok {
+		return conn, nil
+	}
+
+	// if not connected, connect
+	conn, err := grpc.Dial(target, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(2*time.Second))
+	if err != nil {
+		log.Printf("[GRPCClient] Error dialing server %s", target)
+		return nil, err
+	}
+
+	c.conns[target] = conn
+	return conn, nil
 }
 
-func (c *RPCClient) AppendEntries(ctx context.Context, target string, args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply) error {
-	client, err := rpc.Dial("tcp", target)
+func (c *GRPCClient) RequestVote(ctx context.Context, target string, args *raft.RequestVoteArgs, reply *raft.RequestVoteReply) error {
+	conn, err := c.getConnection(target)
 	if err != nil {
-		log.Printf("[RPCClient] Error dialing server %s", target)
 		return err
 	}
-	defer client.Close()
 
-	return client.Call("Raft.AppendEntries", args, reply)
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	req := raft.RequestVoteArgsToProto(args)
+	resp, err := client.RequestVote(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	*reply = *raft.RequestVoteReplyFromProto(resp)
+	return nil
+}
+
+func (c *GRPCClient) AppendEntries(ctx context.Context, target string, args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply) error {
+	conn, err := c.getConnection(target)
+	if err != nil {
+		return err
+	}
+
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	req := raft.AppendEntriesArgsToProto(args)
+	resp, err := client.AppendEntries(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	*reply = *raft.AppendEntriesReplyFromProto(resp)
+	return nil
 }
 
 type ClientRequest struct {
