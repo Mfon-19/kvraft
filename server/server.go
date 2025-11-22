@@ -4,15 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"google.golang.org/grpc"
 	"kvraft/kvstore"
 	pb "kvraft/proto"
 	"kvraft/raft"
 	"log"
 	"net"
-	"net/rpc"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 type RaftKVServer struct {
@@ -42,17 +42,17 @@ func NewRaftKVServer(id int, address string, peers []string) *RaftKVServer {
 	s.store = open
 
 	applyCh := make(chan raft.ApplyMsg, 100)
-	rpcHandler := &RPCClient{}
+	rpcHandler := &GRPCClient{}
 	s.raftNode = raft.NewNode(id, peers, applyCh, rpcHandler)
 
 	go s.applyCommittedEntries(applyCh)
-	return nil
+	return s
 }
 
 func (s *RaftKVServer) Start() error {
 	// register rpc service
-	s.rpcServer = rpc.NewServer()
-	s.rpcServer.RegisterName("Raft", &RaftRPC{server: s})
+	s.grpcServer = grpc.NewServer()
+	pb.RegisterRaftServiceServer(s.grpcServer, &GRPCRaftService{server: s})
 
 	listener, err := net.Listen("tcp", s.address)
 	if err != nil {
@@ -63,12 +63,8 @@ func (s *RaftKVServer) Start() error {
 	log.Printf("[Server %d] Listening on %s", s.id, s.address)
 
 	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go s.rpcServer.ServeConn(conn)
+		if err := s.grpcServer.Serve(listener); err != nil {
+			log.Printf("[Server %d] gRPC server error: %v", s.id, err)
 		}
 	}()
 
@@ -218,10 +214,10 @@ func (c *GRPCClient) getConnection(target string) (*grpc.ClientConn, error) {
 		return conn, nil
 	}
 
-	// if not connected, connect
-	conn, err := grpc.Dial(target, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(2*time.Second))
+	// if not connected, connect asynchronously (no WithBlock to avoid timeout issues)
+	conn, err := grpc.Dial(target, grpc.WithInsecure())
 	if err != nil {
-		log.Printf("[GRPCClient] Error dialing server %s", target)
+		log.Printf("[GRPCClient] Error dialing server %s: %v", target, err)
 		return nil, err
 	}
 

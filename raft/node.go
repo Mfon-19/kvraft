@@ -60,6 +60,7 @@ func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandle
 		voteCh:      make(chan bool, 100),
 		shutdownCh:  make(chan struct{}),
 		rpcHandler:  rpcHandler,
+		rpcTimeout:  2 * time.Second,
 	}
 
 	// dummy entry
@@ -158,50 +159,38 @@ func (n *Node) runCandidate() {
 	}
 
 	wg.Wait()
+	
+	// Count votes
 	for i, r := range replies {
 		if i == n.id {
 			continue
 		}
 
-		n.mu.Lock()
 		// if we find a peer with a higher term,
 		// revert back to follower
 		if r.Term > currentTerm {
+			n.mu.Lock()
 			n.currentTerm = r.Term
 			n.votedFor = -1
 			n.state = Follower
-			// n.runFollower()
-			return
-		}
-
-		if n.state != Candidate || n.currentTerm != currentTerm {
+			n.mu.Unlock()
 			return
 		}
 
 		if r.VoteGranted {
 			votes++
 		}
+	}
 
-		if votes >= votesNeeded {
-			n.state = Leader
-			n.becomeLeader()
-			log.Printf("[Node %d] Won election for term %d", n.id, currentTerm)
-		}
+	// Check if we won
+	n.mu.Lock()
+	if n.state == Candidate && n.currentTerm == currentTerm && votes >= votesNeeded {
+		n.state = Leader
+		log.Printf("[Node %d] is now the LEADER for term %d", n.id, currentTerm)
 		n.mu.Unlock()
-
-		n.resetElectionTimer()
-
-		select {
-		case <-n.electionTimer.C:
-		// jitter + exponential backoff + run new election
-		case <-n.heartbeatCh:
-			// received AppendEntries from leader
-			n.mu.Lock()
-			n.state = Follower
-			n.mu.Unlock()
-		case <-n.shutdownCh:
-			return
-		}
+		n.becomeLeader()
+	} else {
+		n.mu.Unlock()
 	}
 }
 
@@ -224,11 +213,13 @@ func (n *Node) runLeader() {
 
 	go n.applyCommittedEntries()
 
-	select {
-	case <-ticker.C:
-		n.sendHeartbeats()
-	case <-n.shutdownCh:
-		return
+	for {
+		select {
+		case <-ticker.C:
+			n.sendHeartbeats()
+		case <-n.shutdownCh:
+			return
+		}
 	}
 }
 
@@ -289,8 +280,6 @@ func (n *Node) sendHeartbeats() {
 	commitIndex := n.commitIndex
 	n.mu.RUnlock()
 
-	replies := make([]AppendEntriesReply, len(n.peers))
-
 	var wg sync.WaitGroup
 	for i, peer := range n.peers {
 		if i == n.id {
@@ -340,7 +329,7 @@ func (n *Node) sendHeartbeats() {
 
 				ctx, cancel := context.WithTimeout(context.Background(), n.rpcTimeout)
 				var reply AppendEntriesReply
-				err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &replies[peerIdx])
+				err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &reply)
 				cancel()
 				if err != nil {
 					time.Sleep(backoff)
@@ -348,7 +337,7 @@ func (n *Node) sendHeartbeats() {
 					if backoff < 500*time.Millisecond {
 						backoff *= 2
 					}
-					log.Printf("[Node %d] AppendEntries rpc to %s failed", n.id, peerAddr)
+					log.Printf("[Node %d] AppendEntries rpc to %s failed: %v", n.id, peerAddr, err)
 					continue
 				}
 
@@ -436,7 +425,11 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	if (n.votedFor == -1 || n.votedFor == args.CandidateId) && logOk {
 		n.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		n.voteCh <- true
+		// Send to vote channel (non-blocking to avoid deadlock)
+		select {
+		case n.voteCh <- true:
+		default:
+		}
 	}
 }
 
@@ -452,17 +445,29 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		return
 	}
 
-	// update term if necessary
+	// update term if necessary, or step down if we're a leader/candidate
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.state = Follower
 		n.votedFor = -1
+	} else if args.Term == n.currentTerm {
+		// if we receive AppendEntries from leader with same term, step down
+		if n.state != Follower {
+			n.state = Follower
+		}
 	}
 
-	n.heartbeatCh <- true
+	// Send to heartbeat channel (non-blocking to avoid deadlock)
+	select {
+	case n.heartbeatCh <- true:
+	default:
+	}
 
 	// if our logs don't match, tell the leader
-	if args.PrevLogIndex >= len(n.log) || n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex < 0 {
+		// Initial heartbeat case, PrevLogIndex = -1 is valid
+		reply.Success = true
+	} else if args.PrevLogIndex >= len(n.log) || n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
 
