@@ -159,7 +159,7 @@ func (n *Node) runCandidate() {
 	}
 
 	wg.Wait()
-	
+
 	// Count votes
 	for i, r := range replies {
 		if i == n.id {
@@ -204,21 +204,30 @@ func (n *Node) becomeLeader() {
 		n.matchIndex[i] = 0
 	}
 
-	go n.sendHeartbeats()
+	stepDownCh := make(chan struct{}, 1)
+	go n.sendHeartbeats(stepDownCh)
 }
 
 func (n *Node) runLeader() {
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
+	// indicates that this leader should step down
+	// because a higher term was found
+	stepDownCh := make(chan struct{}, 1)
+
+	go n.sendHeartbeats(stepDownCh)
+
 	go n.applyCommittedEntries()
 
 	for {
 		select {
-		case <-ticker.C:
-			n.sendHeartbeats()
 		case <-n.shutdownCh:
 			return
+		case <-stepDownCh:
+			return
+		case <-ticker.C:
+			go n.sendHeartbeats(stepDownCh)
 		}
 	}
 }
@@ -267,7 +276,7 @@ func (n *Node) applyCommittedEntries() {
 	}
 }
 
-func (n *Node) sendHeartbeats() {
+func (n *Node) sendHeartbeats(stepDownCh chan struct{}) {
 	n.mu.RLock()
 	// can't send heartbeats if node isn't leader
 	if n.state != Leader {
@@ -275,114 +284,101 @@ func (n *Node) sendHeartbeats() {
 		return
 	}
 
+	// snapshot current state
 	currentTerm := n.currentTerm
 	leaderId := n.id
 	commitIndex := n.commitIndex
 	n.mu.RUnlock()
 
-	var wg sync.WaitGroup
 	for i, peer := range n.peers {
 		if i == n.id {
 			continue
 		}
 
-		// a goroutine for each peer. this also guarantees the log matching property
-		wg.Add(1)
+		// a goroutine for each peer
 		go func(peerIdx int, peerAddr string) {
-			defer wg.Done()
-
-			backoff := 10 * time.Millisecond
-			for {
-				n.mu.RLock()
-				if n.state != Leader || n.currentTerm != currentTerm {
-					n.mu.RUnlock()
-					return
-				}
-				nextIndex := n.nextIndex[peerIdx]
-
-				prevLogIndex := nextIndex - 1
-				var prevLogTerm int
-				if prevLogIndex >= 0 && prevLogIndex < len(n.log) {
-					prevLogTerm = n.log[prevLogIndex].Term
-				} else {
-					prevLogTerm = 0
-					if prevLogIndex < 0 {
-						prevLogIndex = -1
-					}
-				}
-
-				// get log entries to send
-				var entries []LogEntry
-				if nextIndex >= 0 && nextIndex < len(n.log) {
-					entries = append([]LogEntry(nil), n.log[nextIndex:]...)
-				}
+			n.mu.Lock()
+			// double check that we are still the leader
+			if n.state != Leader {
 				n.mu.RUnlock()
+				return
+			}
 
-				args := &AppendEntriesArgs{
-					Term:         currentTerm,
-					LeaderId:     leaderId,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  prevLogTerm,
-					Entries:      entries,
-					LeaderCommit: commitIndex,
-				}
+			nextIdx := n.nextIndex[peerIdx]
+			prevLogIndex := nextIdx - 1
+			prevLogTerm := 0
 
-				ctx, cancel := context.WithTimeout(context.Background(), n.rpcTimeout)
-				var reply AppendEntriesReply
-				err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &reply)
-				cancel()
-				if err != nil {
-					time.Sleep(backoff)
-					// exponential backoff
-					if backoff < 500*time.Millisecond {
-						backoff *= 2
+			if prevLogIndex >= 0 && prevLogIndex < len(n.log) {
+				prevLogTerm = n.log[prevLogIndex].Term
+			}
+
+			// prepare entries to send
+			var entries []LogEntry
+			if nextIdx < len(n.log) {
+				entries = n.log[nextIdx:]
+			}
+			n.mu.RUnlock()
+
+			args := &AppendEntriesArgs{
+				Term:         currentTerm,
+				LeaderId:     leaderId,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: commitIndex,
+			}
+
+			var reply AppendEntriesReply
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &reply)
+			cancel()
+
+			if err != nil {
+				// we don't need to retry here. the ticker in runLeader() will retry heartbeats
+				return
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			// if reply has a higher term, become follower
+			if reply.Term > currentTerm {
+				if n.currentTerm != reply.Term {
+					n.currentTerm = reply.Term
+					n.votedFor = -1
+					n.state = Follower
+
+					// notify the runLeader() function to stop the loop
+					select {
+					case stepDownCh <- struct{}{}:
+					default:
 					}
-					log.Printf("[Node %d] AppendEntries rpc to %s failed: %v", n.id, peerAddr, err)
-					continue
 				}
+				return
+			}
 
-				// if higher term discovered, step down
-				if reply.Term > currentTerm {
-					n.mu.Lock()
-					if reply.Term > n.currentTerm {
-						n.currentTerm = reply.Term
-						n.votedFor = -1
-						n.state = Follower
-					}
-					n.mu.Unlock()
-					return
-				}
+			// verify state hasn't changed while RPC was in flight
+			if n.state != Leader || n.currentTerm != currentTerm {
+				return
+			}
 
-				if reply.Success {
-					n.mu.Lock()
-
-					match := prevLogIndex + len(entries)
-					if match < 0 {
-						match = prevLogIndex
-					}
-					// update the matchIndex and nextIndex for this peer
-					n.matchIndex[peerIdx] = max(n.matchIndex[peerIdx], match)
-					n.nextIndex[peerIdx] = n.matchIndex[peerIdx] + 1
-
-					// advance the commit index
+			if reply.Success {
+				// update indices
+				match := prevLogIndex + len(entries)
+				if match > n.matchIndex[peerIdx] {
+					n.matchIndex[peerIdx] = match
+					n.nextIndex[peerIdx] = match + 1
 					n.tryAdvanceCommitIndex()
-					n.mu.Unlock()
-					return
 				}
-
-				// here, the log matching property is implemented. we don't use accelerated
-				// backtracking, so this will be O(n) in the worst case which is fine
-				n.mu.Lock()
+			} else {
+				// on log inconsistency, decrement nextIndex. since runLeader()
+				// sends heartbeats at intervals, this meets the log matching property
 				if n.nextIndex[peerIdx] > 1 {
 					n.nextIndex[peerIdx]--
 				}
-				n.mu.Unlock()
 			}
-
 		}(i, peer)
 	}
-
-	wg.Wait()
 }
 
 func (n *Node) resetElectionTimer() {
