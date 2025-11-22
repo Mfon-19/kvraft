@@ -86,6 +86,7 @@ func (n *Node) run() {
 
 		switch state {
 		case Follower:
+			n.resetElectionTimer()
 			n.runFollower()
 		case Leader:
 			n.runLeader()
@@ -121,76 +122,74 @@ func (n *Node) runCandidate() {
 	currentTerm := n.currentTerm
 	lastLogIndex := len(n.log) - 1
 	lastLogTerm := n.log[lastLogIndex].Term
-	n.mu.Unlock()
 
-	log.Printf("[Node %d] Starting election for term %d", n.id, currentTerm)
-
-	votes := 1
-	// needs a majority vote
-	votesNeeded := (len(n.peers)+1)/2 + 1
-
-	replies := make([]RequestVoteReply, len(n.peers))
 	args := &RequestVoteArgs{
 		Term:         currentTerm,
 		CandidateId:  n.id,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
+	n.mu.Unlock()
 
-	var wg sync.WaitGroup
+	log.Printf("[Node %d] Starting election for term %d", n.id, currentTerm)
+
+	voteCh := make(chan RequestVoteReply, len(n.peers))
+
 	for i, peer := range n.peers {
 		if i == n.id {
 			continue
 		}
 
-		wg.Add(1)
-		go func(peerAddr string, index int) {
-			defer wg.Done()
-
-			ctx, cancel := context.WithTimeout(context.Background(), n.rpcTimeout)
+		go func(peerAddr string) {
+			var reply RequestVoteReply
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
 
-			err := n.rpcHandler.RequestVote(ctx, peerAddr, args, &replies[index])
-			if err != nil {
-				log.Printf("[Node %d] Error requesting vote from %s", n.id, peerAddr)
+			err := n.rpcHandler.RequestVote(ctx, peerAddr, args, &reply)
+			if err == nil {
+				voteCh <- reply
+			}
+		}(peer)
+	}
+
+	votes := 1
+	votesNeeded := (len(n.peers)+1)/2 + 1
+
+	// loop until we win, lose or timeout
+	for {
+		select {
+		case r := <-voteCh:
+			// found someone with a higher term
+			if r.Term > currentTerm {
+				n.mu.Lock()
+				n.currentTerm = r.Term
+				n.votedFor = -1
+				n.state = Follower
+				n.mu.Unlock()
 				return
 			}
-		}(peer, i)
-	}
-
-	wg.Wait()
-
-	// Count votes
-	for i, r := range replies {
-		if i == n.id {
-			continue
-		}
-
-		// if we find a peer with a higher term,
-		// revert back to follower
-		if r.Term > currentTerm {
-			n.mu.Lock()
-			n.currentTerm = r.Term
-			n.votedFor = -1
-			n.state = Follower
-			n.mu.Unlock()
+			if r.VoteGranted {
+				votes++
+			}
+			if votes >= votesNeeded {
+				n.mu.Lock()
+				// double check state hasn't changed
+				if n.state == Candidate && n.currentTerm == currentTerm {
+					n.state = Leader
+					log.Printf("[Node %d] is now the LEADER for term %d", n.id, currentTerm)
+					n.mu.Unlock()
+					n.becomeLeader()
+					return
+				}
+				n.mu.Unlock()
+			}
+		case <-n.electionTimer.C:
+			// election failed, return to the run() function which will loop
+			// back to runCandidate after a timeout
+			return
+		case <-n.shutdownCh:
 			return
 		}
-
-		if r.VoteGranted {
-			votes++
-		}
-	}
-
-	// Check if we won
-	n.mu.Lock()
-	if n.state == Candidate && n.currentTerm == currentTerm && votes >= votesNeeded {
-		n.state = Leader
-		log.Printf("[Node %d] is now the LEADER for term %d", n.id, currentTerm)
-		n.mu.Unlock()
-		n.becomeLeader()
-	} else {
-		n.mu.Unlock()
 	}
 }
 
@@ -203,9 +202,6 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[i] = lastLogIndex + 1
 		n.matchIndex[i] = 0
 	}
-
-	stepDownCh := make(chan struct{}, 1)
-	go n.sendHeartbeats(stepDownCh)
 }
 
 func (n *Node) runLeader() {
@@ -297,7 +293,7 @@ func (n *Node) sendHeartbeats(stepDownCh chan struct{}) {
 
 		// a goroutine for each peer
 		go func(peerIdx int, peerAddr string) {
-			n.mu.Lock()
+			n.mu.RLock()
 			// double check that we are still the leader
 			if n.state != Leader {
 				n.mu.RUnlock()
