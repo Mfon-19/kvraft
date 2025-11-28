@@ -21,10 +21,11 @@ type ClientResponse struct {
 }
 
 func sendRequest(address string, req ClientRequest) (ClientResponse, error) {
-	conn, err := net.Dial("tcp", address)
+	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
 	if err != nil {
 		return ClientResponse{}, err
 	}
+	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
 	defer conn.Close()
 
 	encoder := json.NewEncoder(conn)

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type RaftKVServer struct {
@@ -75,25 +76,27 @@ func (s *RaftKVServer) applyCommittedEntries(applyCh chan raft.ApplyMsg) {
 	for msg := range applyCh {
 		s.mu.Lock()
 
+		var applyErr error
+
 		// apply the message to our kv store
 		switch msg.Command.Type {
 		case "put":
-			err := s.store.Put(msg.Command.Key, msg.Command.Value)
-			if err != nil {
-				log.Printf("[Server %d] Error applying PUT: %s = %s", s.id, msg.Command.Key, msg.Command.Value)
-				return
+			applyErr = s.store.Put(msg.Command.Key, msg.Command.Value)
+			if applyErr == nil {
+				log.Printf("[Server %d] Applied PUT: %s = %s", s.id, msg.Command.Key, msg.Command.Value)
 			}
-			log.Printf("[Server %d] Applied PUT: %s = %s", s.id, msg.Command.Key, msg.Command.Value)
 		case "delete":
-			err := s.store.Delete(msg.Command.Key)
-			if err != nil {
-				log.Printf("[Server %d] Error applying DELETE: %s", s.id, msg.Command.Key)
-				return
+			applyErr = s.store.Delete(msg.Command.Key)
+			if applyErr == nil {
+				log.Printf("[Server %d] Applied DELETE: %s", s.id, msg.Command.Key)
 			}
-			log.Printf("[Server %d] Applied DELETE: %s", s.id, msg.Command.Key)
 		}
 
-		// notify the pending request
+		if applyErr != nil {
+			log.Printf("[Server %d] Error applying %s: %v", s.id, msg.Command.Type, applyErr)
+		}
+
+		// notify the pending request regardless of apply status to avoid client hangs
 		s.pendingLock.Lock()
 		if ch, ok := s.pending[msg.Index]; ok {
 			ch <- msg.Command.Value
@@ -131,11 +134,16 @@ func (s *RaftKVServer) Put(key, value string) error {
 	s.pending[index] = ch
 	s.pendingLock.Unlock()
 
-	select {
-	case <-ch:
-		// command applied
-		return nil
-	}
+        select {
+        case <-ch:
+                // command applied
+                return nil
+        case <-time.After(5 * time.Second):
+                s.pendingLock.Lock()
+                delete(s.pending, index)
+                s.pendingLock.Unlock()
+                return fmt.Errorf("put command timed out waiting for commit")
+        }
 }
 
 func (s *RaftKVServer) Delete(key string) error {
@@ -154,10 +162,15 @@ func (s *RaftKVServer) Delete(key string) error {
 	s.pending[index] = ch
 	s.pendingLock.Unlock()
 
-	select {
-	case <-ch:
-		return nil
-	}
+        select {
+        case <-ch:
+                return nil
+        case <-time.After(5 * time.Second):
+                s.pendingLock.Lock()
+                delete(s.pending, index)
+                s.pendingLock.Unlock()
+                return fmt.Errorf("delete command timed out waiting for commit")
+        }
 }
 
 func (s *RaftKVServer) IsLeader() bool {
