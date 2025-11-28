@@ -93,20 +93,18 @@ echo "========================================="
 echo ""
 
 # Build peer lists for each node
-PEERS_0="localhost:$RAFT_PORT_1,localhost:$RAFT_PORT_2"
-PEERS_1="localhost:$RAFT_PORT_0,localhost:$RAFT_PORT_2"
-PEERS_2="localhost:$RAFT_PORT_0,localhost:$RAFT_PORT_1"
+ALL_PEERS="localhost:$RAFT_PORT_0,localhost:$RAFT_PORT_1,localhost:$RAFT_PORT_2"
 
 # Start nodes in background
-./raft-kv -id=0 -port=$RAFT_PORT_0 -client-port=$CLIENT_PORT_0 -peers=$PEERS_0 &
+./raft-kv -id=0 -port=$RAFT_PORT_0 -client-port=$CLIENT_PORT_0 -peers=$ALL_PEERS &
 PID1=$!
 echo "Started Node 0 (PID: $PID1)"
 
-./raft-kv -id=1 -port=$RAFT_PORT_1 -client-port=$CLIENT_PORT_1 -peers=$PEERS_1 &
+./raft-kv -id=1 -port=$RAFT_PORT_1 -client-port=$CLIENT_PORT_1 -peers=$ALL_PEERS &
 PID2=$!
 echo "Started Node 1 (PID: $PID2)"
 
-./raft-kv -id=2 -port=$RAFT_PORT_2 -client-port=$CLIENT_PORT_2 -peers=$PEERS_2 &
+./raft-kv -id=2 -port=$RAFT_PORT_2 -client-port=$CLIENT_PORT_2 -peers=$ALL_PEERS &
 PID3=$!
 echo "Started Node 2 (PID: $PID3)"
 

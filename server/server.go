@@ -4,15 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/grpc"
 	"kvraft/kvstore"
 	pb "kvraft/proto"
 	"kvraft/raft"
 	"log"
 	"net"
 	"sync"
-	"time"
-
-	"google.golang.org/grpc"
 )
 
 type RaftKVServer struct {
@@ -35,7 +33,8 @@ func NewRaftKVServer(id int, address string, peers []string) *RaftKVServer {
 		pending: make(map[int]chan string),
 	}
 
-	open, err := kvstore.Open("newdir")
+	dir := fmt.Sprintf("kvstore_%d", id)
+	open, err := kvstore.Open(dir)
 	if err != nil {
 		return nil
 	}
@@ -232,8 +231,6 @@ func (c *GRPCClient) RequestVote(ctx context.Context, target string, args *raft.
 	}
 
 	client := pb.NewRaftServiceClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 
 	req := raft.RequestVoteArgsToProto(args)
 	resp, err := client.RequestVote(ctx, req)
@@ -252,8 +249,6 @@ func (c *GRPCClient) AppendEntries(ctx context.Context, target string, args *raf
 	}
 
 	client := pb.NewRaftServiceClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 
 	req := raft.AppendEntriesArgsToProto(args)
 	resp, err := client.AppendEntries(ctx, req)

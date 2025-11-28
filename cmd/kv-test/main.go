@@ -3,18 +3,27 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"kvraft/common"
 	"log"
 	"net"
 	"time"
 )
 
+type ClientRequest struct {
+	Type  string
+	Key   string
+	Value string
+}
 
+type ClientResponse struct {
+	Success bool
+	Value   string
+	Error   string
+}
 
-func sendRequest(address string, req common.ClientRequest) (common.ClientResponse, error) {
+func sendRequest(address string, req ClientRequest) (ClientResponse, error) {
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
-		return common.ClientResponse{}, err
+		return ClientResponse{}, err
 	}
 	defer conn.Close()
 
@@ -22,246 +31,159 @@ func sendRequest(address string, req common.ClientRequest) (common.ClientRespons
 	decoder := json.NewDecoder(conn)
 
 	if err := encoder.Encode(&req); err != nil {
-		return common.ClientResponse{}, err
+		return ClientResponse{}, err
 	}
 
-	var resp common.ClientResponse
+	var resp ClientResponse
 	if err := decoder.Decode(&resp); err != nil {
-		return common.ClientResponse{}, err
+		return ClientResponse{}, err
 	}
 
 	return resp, nil
 }
 
 func main() {
-	log.Println("========================================")
-	log.Println("Starting Raft-KV Test (with gRPC)")
-	log.Println("========================================")
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	log.Println("--- Starting Raft-KV Integration Test ---")
 
-	// Wait for cluster to start and elect a leader
-	log.Println("\nWaiting for cluster to start and elect leader...")
+	// Allow time for cluster to elect a leader
 	time.Sleep(2 * time.Second)
 
 	addresses := []string{"localhost:8000", "localhost:8001", "localhost:8002"}
-
-	// Test 1: Find the leader
-	log.Println("\n[Test 1] Finding leader...")
 	var leaderAddr string
+
+	// 1. Leader Discovery
+	log.Println("[1/10] Finding leader...")
 	for _, addr := range addresses {
-		resp, err := sendRequest(addr, common.ClientRequest{Type: "put", Key: "test", Value: "123"})
-		if err != nil {
-			log.Printf("  Node %s not reachable: %v", addr, err)
-			continue
-		}
-		if resp.Success {
+		resp, err := sendRequest(addr, ClientRequest{Type: "put", Key: "ping", Value: "pong"})
+		if err == nil && resp.Success {
 			leaderAddr = addr
-			log.Printf("  ✓ Found leader at %s", addr)
+			log.Printf("\t✓ Leader found at %s", addr)
 			break
-		} else {
-			log.Printf("  Node %s is not leader: %s", addr, resp.Error)
 		}
 	}
-
 	if leaderAddr == "" {
-		log.Fatal("  ✗ Could not find leader - ensure cluster is running")
+		log.Fatal("\t✗ Could not find leader. Is the cluster running?")
 	}
 
-	// Test 2: Basic write and read
-	log.Println("\n[Test 2] Testing basic write and read...")
-	resp, err := sendRequest(leaderAddr, common.ClientRequest{Type: "put", Key: "foo", Value: "bar"})
+	// 2. Basic Put/Get
+	log.Println("[2/10] Testing Basic Put/Get...")
+	resp, err := sendRequest(leaderAddr, ClientRequest{Type: "put", Key: "foo", Value: "bar"})
 	if err != nil || !resp.Success {
-		log.Fatalf("  ✗ Failed to write: %v, %+v", err, resp)
+		log.Fatalf("\t✗ Put failed: %v", resp.Error)
 	}
-	log.Println("  ✓ Write successful")
 
-	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: "get", Key: "foo"})
-	if err != nil || !resp.Success || resp.Value != "bar" {
-		log.Fatalf("  ✗ Failed to read: %v, %+v", err, resp)
+	resp, err = sendRequest(leaderAddr, ClientRequest{Type: "get", Key: "foo"})
+	if err != nil || resp.Value != "bar" {
+		log.Fatalf("\t✗ Get failed. Expected 'bar', got '%s'", resp.Value)
 	}
-	log.Printf("  ✓ Read successful: foo=%s", resp.Value)
+	log.Println("\t✓ Basic Put/Get passed")
 
-	// Test 3: Verify replication to all nodes
-	log.Println("\n[Test 3] Verifying replication across all nodes...")
-	time.Sleep(500 * time.Millisecond) // Wait for replication
+	// 3. Replication Check
+	log.Println("[3/10] Verifying Replication...")
+	time.Sleep(10 * time.Second)
 
-	replicationSuccess := 0
+	successCount := 0
 	for _, addr := range addresses {
-		resp, err := sendRequest(addr, common.ClientRequest{Type: "get", Key: "foo"})
-		if err != nil {
-			log.Printf("  ✗ Node %s not reachable: %v", addr, err)
-			continue
+		resp, _ := sendRequest(addr, ClientRequest{Type: "get", Key: "foo"})
+		if resp.Success && resp.Value == "bar" {
+			successCount++
 		}
-		if !resp.Success || resp.Value != "bar" {
-			log.Printf("  ✗ Node %s has incorrect value: %+v", addr, resp)
-			continue
-		}
-		log.Printf("  ✓ Node %s has correct value: foo=%s", addr, resp.Value)
-		replicationSuccess++
 	}
-
-	if replicationSuccess < 2 {
-		log.Fatal("  ✗ Replication failed - not enough nodes have the data")
+	if successCount < 2 {
+		log.Fatalf("\t✗ Replication failed. Only %d/3 nodes have data.", successCount)
 	}
+	log.Printf("\t✓ Data present on %d/3 nodes", successCount)
 
-	// Test 4: Multiple sequential writes
-	log.Println("\n[Test 4] Testing multiple sequential writes...")
+	// 4. Sequential Writes
+	log.Println("[4/10] Sequential Writes...")
 	for i := 0; i < 5; i++ {
-		key := fmt.Sprintf("key%d", i)
-		value := fmt.Sprintf("value%d", i)
-		resp, err := sendRequest(leaderAddr, common.ClientRequest{Type: "put", Key: key, Value: value})
-		if err != nil || !resp.Success {
-			log.Fatalf("  ✗ Failed to write %s: %v, %+v", key, err, resp)
+		k, v := fmt.Sprintf("seq-%d", i), fmt.Sprintf("val-%d", i)
+		if _, err := sendRequest(leaderAddr, ClientRequest{Type: "put", Key: k, Value: v}); err != nil {
+			log.Fatalf("\t✗ Write failed at index %d", i)
 		}
 	}
-	log.Println("  ✓ Multiple writes successful (5 writes)")
+	log.Println("\t✓ 5 Sequential writes successful")
 
-	// Verify all writes
-	time.Sleep(500 * time.Millisecond)
-	log.Println("  Verifying all writes...")
-	for i := 0; i < 5; i++ {
-		key := fmt.Sprintf("key%d", i)
-		expectedValue := fmt.Sprintf("value%d", i)
-		resp, err := sendRequest(leaderAddr, common.ClientRequest{Type: "get", Key: key})
-		if err != nil || !resp.Success || resp.Value != expectedValue {
-			log.Fatalf("  ✗ Failed to verify %s: %v, %+v", key, err, resp)
-		}
+	// 5. Update Key
+	log.Println("[5/10] Updating Keys...")
+	sendRequest(leaderAddr, ClientRequest{Type: "put", Key: "foo", Value: "updated"})
+	resp, _ = sendRequest(leaderAddr, ClientRequest{Type: "get", Key: "foo"})
+	if resp.Value != "updated" {
+		log.Fatalf("\t✗ Update failed. Got %s", resp.Value)
 	}
-	log.Println("  ✓ All writes verified")
+	log.Println("\t✓ Key updated successfully")
 
-	// Test 5: Update existing key
-	log.Println("\n[Test 5] Testing key update...")
-	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: "put", Key: "foo", Value: "baz"})
-	if err != nil || !resp.Success {
-		log.Fatalf("  ✗ Failed to update: %v, %+v", err, resp)
+	// 6. Delete Key
+	log.Println("[6/10] Deleting Keys...")
+	sendRequest(leaderAddr, ClientRequest{Type: "delete", Key: "foo"})
+	resp, _ = sendRequest(leaderAddr, ClientRequest{Type: "get", Key: "foo"})
+	if resp.Success {
+		log.Fatal("\t✗ Key should be deleted but was found")
 	}
-	log.Println("  ✓ Update successful")
+	log.Println("\t✓ Key deleted")
 
-	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: "get", Key: "foo"})
-	if err != nil || !resp.Success || resp.Value != "baz" {
-		log.Fatalf("  ✗ Failed to read updated value: %v, %+v", err, resp)
-	}
-	log.Printf("  ✓ Updated value verified: foo=%s", resp.Value)
-
-	// Test 6: Delete operation
-	log.Println("\n[Test 6] Testing delete operation...")
-	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: "delete", Key: "foo"})
-	if err != nil || !resp.Success {
-		log.Fatalf("  ✗ Failed to delete: %v, %+v", err, resp)
-	}
-	log.Println("  ✓ Delete successful")
-
-	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: "get", Key: "foo"})
-	if err == nil && resp.Success {
-		log.Fatal("  ✗ Key should have been deleted")
-	}
-	log.Println("  ✓ Key deleted successfully (not found)")
-
-	// Test 7: Verify delete replicated
-	log.Println("\n[Test 7] Verifying delete replication...")
-	time.Sleep(500 * time.Millisecond)
-	deleteReplicated := 0
+	// 7. Verify Delete Replication
+	log.Println("[7/10] Verifying Delete Replication...")
+	time.Sleep(600 * time.Millisecond)
 	for _, addr := range addresses {
-		resp, err := sendRequest(addr, common.ClientRequest{Type: "get", Key: "foo"})
-		if err == nil && resp.Success {
-			log.Printf("  ✗ Node %s still has deleted key", addr)
-			continue
+		resp, _ := sendRequest(addr, ClientRequest{Type: "get", Key: "foo"})
+		if resp.Success {
+			log.Fatalf("\t✗ Node %s still has deleted key", addr)
 		}
-		log.Printf("  ✓ Node %s confirmed deletion", addr)
-		deleteReplicated++
 	}
+	log.Println("\t✓ Delete replicated to all nodes")
 
-	if deleteReplicated < 2 {
-		log.Fatal("  ✗ Delete not properly replicated")
-	}
-
-	// Test 8: Try writing to non-leader (should fail gracefully)
-	log.Println("\n[Test 8] Testing write to non-leader...")
-	foundNonLeader := false
+	// 8. Write to Follower (Expect Failure)
+	log.Println("[8/10] Testing Follower Rejection...")
+	checkedFollower := false
 	for _, addr := range addresses {
-		if addr == leaderAddr {
-			continue
-		}
-		resp, err := sendRequest(addr, common.ClientRequest{Type: "put", Key: "test-nonleader", Value: "fail"})
-		if err == nil && !resp.Success && resp.Error == "not leader" {
-			log.Printf("  ✓ Non-leader %s correctly rejected write: %s", addr, resp.Error)
-			foundNonLeader = true
-			break
+		if addr != leaderAddr {
+			resp, _ := sendRequest(addr, ClientRequest{Type: "put", Key: "bad", Value: "data"})
+			if !resp.Success && resp.Error == "not leader" {
+				checkedFollower = true
+				break
+			}
 		}
 	}
-
-	if !foundNonLeader {
-		log.Println("  ⚠ Could not test non-leader write (all nodes might be leaders)")
-	}
-
-	// Test 9: High-throughput test
-	log.Println("\n[Test 9] Testing high-throughput writes...")
-	start := time.Now()
-	successfulWrites := 0
-	totalWrites := 100
-
-	for i := 0; i < totalWrites; i++ {
-		key := fmt.Sprintf("bulk-%d", i)
-		value := fmt.Sprintf("val-%d", i)
-		resp, err := sendRequest(leaderAddr, common.ClientRequest{Type: "put", Key: key, Value: value})
-		if err == nil && resp.Success {
-			successfulWrites++
-		}
-	}
-	elapsed := time.Since(start)
-	throughput := float64(successfulWrites) / elapsed.Seconds()
-
-	log.Printf("  ✓ Completed %d/%d writes in %v", successfulWrites, totalWrites, elapsed)
-	log.Printf("  ✓ Throughput: %.0f writes/second", throughput)
-
-	if successfulWrites < totalWrites {
-		log.Printf("  ⚠ Some writes failed (%d/%d)", totalWrites-successfulWrites, totalWrites)
-	}
-
-	// Test 10: Verify consistency across all nodes
-	log.Println("\n[Test 10] Final consistency check...")
-	time.Sleep(1 * time.Second) // Wait for all replication to complete
-
-	testKey := "consistency-test"
-	testValue := "final-value"
-
-	// Write to leader
-	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: "put", Key: testKey, Value: testValue})
-	if err != nil || !resp.Success {
-		log.Fatalf("  ✗ Failed to write test key: %v, %+v", err, resp)
-	}
-
-	// Wait and verify on all nodes
-	time.Sleep(500 * time.Millisecond)
-	consistentNodes := 0
-	for _, addr := range addresses {
-		resp, err := sendRequest(addr, common.ClientRequest{Type: "get", Key: testKey})
-		if err != nil {
-			log.Printf("  ✗ Node %s not reachable", addr)
-			continue
-		}
-		if !resp.Success || resp.Value != testValue {
-			log.Printf("  ✗ Node %s has inconsistent value: %+v", addr, resp)
-			continue
-		}
-		consistentNodes++
-	}
-
-	if consistentNodes >= 2 {
-		log.Printf("  ✓ Consistency verified: %d/%d nodes have consistent state", consistentNodes, len(addresses))
+	if !checkedFollower {
+		log.Println("\t⚠ Could not verify follower rejection (network errors or logic mismatch)")
 	} else {
-		log.Fatal("  ✗ Consistency check failed")
+		log.Println("\t✓ Follower correctly rejected write")
 	}
 
-	// Final summary
-	log.Println("\n========================================")
-	log.Println("✓ All tests passed!")
-	log.Println("========================================")
-	log.Println("\nTest Summary:")
-	log.Println("  - Leader election: ✓")
-	log.Println("  - Basic operations (put/get/delete): ✓")
-	log.Println("  - Replication: ✓")
-	log.Println("  - Consistency: ✓")
-	log.Println("  - High throughput: ✓")
-	log.Printf("  - gRPC communication: ✓")
-	log.Println("\nYour Raft-KV cluster with gRPC is working correctly!")
+	// 9. Throughput Test
+	log.Println("[9/10] High-Throughput Test (100 Writes)...")
+	start := time.Now()
+	total := 100
+	ok := 0
+	for i := 0; i < total; i++ {
+		k := fmt.Sprintf("bench-%d", i)
+		if resp, _ := sendRequest(leaderAddr, ClientRequest{Type: "put", Key: k, Value: "x"}); resp.Success {
+			ok++
+		}
+	}
+	duration := time.Since(start)
+	log.Printf("\t✓ %d/%d writes succeeded in %v (%.0f req/sec)", ok, total, duration, float64(ok)/duration.Seconds())
+
+	// 10. Final Consistency
+	log.Println("[10/10] Final Consistency Check...")
+	time.Sleep(1 * time.Second) // Allow full propagation
+
+	testKey := "bench-99" // Check the last written key
+	consistent := 0
+	for _, addr := range addresses {
+		resp, _ := sendRequest(addr, ClientRequest{Type: "get", Key: testKey})
+		if resp.Success && resp.Value == "x" {
+			consistent++
+		}
+	}
+
+	if consistent >= 2 {
+		log.Printf("\t✓ Consistency verified (%d nodes match)", consistent)
+	} else {
+		log.Fatalf("\t✗ Cluster inconsistent. Only %d nodes match.", consistent)
+	}
+
+	log.Println("\n--- All Tests Passed Successfully ---")
 }

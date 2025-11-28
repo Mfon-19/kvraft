@@ -28,6 +28,7 @@ type Node struct {
 	// leader state only used when node is the leader
 	nextIndex  map[int]int
 	matchIndex map[int]int
+	stepDownCh chan struct{}
 
 	// channels
 	applyCh       chan ApplyMsg
@@ -65,6 +66,7 @@ func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandle
 
 	// dummy entry
 	n.log[0] = LogEntry{Term: 0, Index: 0}
+	go n.applyCommittedEntries()
 
 	go n.run()
 	return n
@@ -208,22 +210,20 @@ func (n *Node) runLeader() {
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
-	// indicates that this leader should step down
-	// because a higher term was found
-	stepDownCh := make(chan struct{}, 1)
+	n.mu.Lock()
+	n.stepDownCh = make(chan struct{}, 1)
+	n.mu.Unlock()
 
-	go n.sendHeartbeats(stepDownCh)
-
-	go n.applyCommittedEntries()
+	go n.sendHeartbeats(n.stepDownCh)
 
 	for {
 		select {
 		case <-n.shutdownCh:
 			return
-		case <-stepDownCh:
+		case <-n.stepDownCh:
 			return
 		case <-ticker.C:
-			go n.sendHeartbeats(stepDownCh)
+			go n.sendHeartbeats(n.stepDownCh)
 		}
 	}
 }
@@ -331,6 +331,7 @@ func (n *Node) sendHeartbeats(stepDownCh chan struct{}) {
 
 			if err != nil {
 				// we don't need to retry here. the ticker in runLeader() will retry heartbeats
+				log.Printf("[Node %d] Heartbeat to %s failed: %v", n.id, peerAddr, err)
 				return
 			}
 
@@ -429,6 +430,8 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// log.Printf("[Node %d] Received heartbeat from Leader %d (Term %d)", n.id, args.LeaderId, args.Term)
+
 	reply.Term = n.currentTerm
 	reply.Success = false
 
@@ -503,6 +506,8 @@ func (n *Node) Submit(cmd Command) (int, int, bool) {
 		Command: cmd,
 	}
 	n.log = append(n.log, entry)
+
+	go n.sendHeartbeats(n.stepDownCh)
 
 	log.Printf("[Node %d] Appended entry at %d: %+v", n.id, index, cmd)
 	return index, n.currentTerm, true
