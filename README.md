@@ -340,13 +340,3 @@ raft-kv/
 **Distributed Systems Concepts:**
 - [Designing Data-Intensive Applications](https://dataintensive.net/) by Martin Kleppmann
 - [Distributed Systems](https://www.distributed-systems.net/index.php/books/ds3/) by Maarten van Steen
-
-## License
-
-MIT
-
-## Acknowledgments
-
-- Diego Ongaro and John Ousterhout for the Raft algorithm
-- Basho Technologies for the Bitcask design
-- The Go team for excellent concurrency primitives
