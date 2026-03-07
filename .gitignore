@@ -12,12 +12,22 @@ cmd/testdb/
 /kv-test
 /kv-bench
 /raft-kv
+/caskv-client
+/caskv-server
+/caskv-test
+/caskv-bench
 /dist/
 
 # Runtime and integration-test artifacts
 /node*.log
 /kvstore_[0-9]*/
 /benchmark-artifacts/
+
+# Local benchmark and scratch artifacts
+/newdir/
+/main.py
+/sample.txt
+
 *.test
 *.prof
 *.out
