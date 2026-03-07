@@ -15,3 +15,7 @@ cmd/testdb/
 # Runtime and integration-test artifacts
 /node*.log
 /kvstore_[0-9]*/
+/benchmark-artifacts/
+*.test
+*.prof
+*.out
