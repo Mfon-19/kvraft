@@ -2,7 +2,7 @@ package raft
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
@@ -29,7 +29,6 @@ type Node struct {
 	// leader state only used when node is the leader
 	nextIndex  map[int]int
 	matchIndex map[int]int
-	stepDownCh chan struct{}
 
 	// channels
 	applyCh chan ApplyMsg
@@ -39,6 +38,10 @@ type Node struct {
 	voteCh         chan bool
 	shutdownCh     chan struct{}
 	electionTimer  *time.Timer
+
+	// One long-lived replication worker per follower. Workers are signaled on
+	// submit and heartbeat ticks instead of spawning per-tick goroutines.
+	replicationTrigger map[int]chan struct{}
 
 	rpcHandler RPCHandler
 	rpcTimeout time.Duration
@@ -51,28 +54,39 @@ type RPCHandler interface {
 
 func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandler) *Node {
 	n := &Node{
-		id:             id,
-		peers:          peers,
-		currentTerm:    0,
-		votedFor:       -1, // voted for no one yet
-		log:            make([]LogEntry, 1),
-		commitIndex:    0,
-		lastApplied:    0,
-		state:          Follower, // every raft node starts out as a follower
-		applyCh:        applyCh,
-		commitNotifyCh: make(chan struct{}, 1),
-		heartbeatCh:    make(chan bool, 100),
-		voteCh:         make(chan bool, 100),
-		shutdownCh:     make(chan struct{}),
-		rpcHandler:     rpcHandler,
-		rpcTimeout:     2 * time.Second,
+		id:                 id,
+		peers:              peers,
+		currentTerm:        0,
+		votedFor:           -1,
+		log:                make([]LogEntry, 1),
+		commitIndex:        0,
+		lastApplied:        0,
+		state:              Follower,
+		applyCh:            applyCh,
+		commitNotifyCh:     make(chan struct{}, 1),
+		heartbeatCh:        make(chan bool, 100),
+		voteCh:             make(chan bool, 100),
+		shutdownCh:         make(chan struct{}),
+		replicationTrigger: make(map[int]chan struct{}),
+		rpcHandler:         rpcHandler,
+		rpcTimeout:         2 * time.Second,
 	}
 
 	// dummy entry
 	n.log[0] = LogEntry{Term: 0, Index: 0}
-	go n.applyCommittedEntries()
 
+	for i, peer := range peers {
+		if i == id {
+			continue
+		}
+		ch := make(chan struct{}, 1)
+		n.replicationTrigger[i] = ch
+		go n.replicationWorker(i, peer, ch)
+	}
+
+	go n.applyCommittedEntries()
 	go n.run()
+
 	return n
 }
 
@@ -92,7 +106,6 @@ func (n *Node) run() {
 
 		switch state {
 		case Follower:
-			n.resetElectionTimer()
 			n.runFollower()
 		case Leader:
 			n.runLeader()
@@ -103,13 +116,14 @@ func (n *Node) run() {
 }
 
 func (n *Node) runFollower() {
+	n.resetElectionTimer()
+
 	select {
 	case <-n.heartbeatCh:
 		n.resetElectionTimer()
 	case <-n.voteCh:
 		n.resetElectionTimer()
 	case <-n.electionTimer.C:
-		// election timeout. become a candidate
 		n.mu.Lock()
 		n.state = Candidate
 		n.mu.Unlock()
@@ -121,8 +135,8 @@ func (n *Node) runFollower() {
 func (n *Node) runCandidate() {
 	n.mu.Lock()
 
-	// prerequisites for a new candidate.
-	// increase current term, vote for self
+	// prerequisites for a new candidate:
+	// increase current term and vote for self.
 	n.currentTerm++
 	n.votedFor = n.id
 	currentTerm := n.currentTerm
@@ -137,7 +151,7 @@ func (n *Node) runCandidate() {
 	}
 	n.mu.Unlock()
 
-	log.Printf("[Node %d] Starting election for term %d", n.id, currentTerm)
+	slog.Debug("raft election started", "node_id", n.id, "term", currentTerm)
 
 	voteCh := make(chan RequestVoteReply, len(n.peers))
 
@@ -154,25 +168,22 @@ func (n *Node) runCandidate() {
 			err := n.rpcHandler.RequestVote(ctx, peerAddr, args, &reply)
 			if err == nil {
 				voteCh <- reply
-			} else {
-				log.Printf("[Node %d] RequestVote RPC to %s failed: %v", n.id, peerAddr, err)
+				return
 			}
+			slog.Debug("raft request vote failed", "node_id", n.id, "peer", peerAddr, "error", err)
 		}(peer)
 	}
 
 	votes := 1
 	votesNeeded := (len(n.peers)+1)/2 + 1
+	n.resetElectionTimer()
 
-	// loop until we win, lose or timeout
 	for {
 		select {
 		case r := <-voteCh:
-			// found someone with a higher term
 			if r.Term > currentTerm {
 				n.mu.Lock()
-				n.currentTerm = r.Term
-				n.votedFor = -1
-				n.state = Follower
+				n.becomeFollowerLocked(r.Term)
 				n.mu.Unlock()
 				return
 			}
@@ -181,34 +192,20 @@ func (n *Node) runCandidate() {
 			}
 			if votes >= votesNeeded {
 				n.mu.Lock()
-				// double check state hasn't changed
 				if n.state == Candidate && n.currentTerm == currentTerm {
-					n.state = Leader
-					log.Printf("[Node %d] is now the LEADER for term %d", n.id, currentTerm)
+					n.becomeLeaderLocked()
+					slog.Info("raft leader elected", "node_id", n.id, "term", currentTerm)
 					n.mu.Unlock()
-					n.becomeLeader()
+					n.signalAllReplications()
 					return
 				}
 				n.mu.Unlock()
 			}
 		case <-n.electionTimer.C:
-			// election failed, return to the run() function which will loop
-			// back to runCandidate after a timeout
 			return
 		case <-n.shutdownCh:
 			return
 		}
-	}
-}
-
-func (n *Node) becomeLeader() {
-	n.nextIndex = make(map[int]int)
-	n.matchIndex = make(map[int]int)
-
-	lastLogIndex := len(n.log) - 1
-	for i := range n.peers {
-		n.nextIndex[i] = lastLogIndex + 1
-		n.matchIndex[i] = 0
 	}
 }
 
@@ -216,32 +213,162 @@ func (n *Node) runLeader() {
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
-	n.mu.Lock()
-	n.stepDownCh = make(chan struct{}, 1)
-	n.mu.Unlock()
-
-	go n.sendHeartbeats(n.stepDownCh)
+	n.signalAllReplications()
 
 	for {
 		select {
 		case <-n.shutdownCh:
 			return
-		case <-n.stepDownCh:
-			return
 		case <-ticker.C:
-			go n.sendHeartbeats(n.stepDownCh)
+			n.mu.RLock()
+			isLeader := n.state == Leader
+			n.mu.RUnlock()
+			if !isLeader {
+				return
+			}
+			n.signalAllReplications()
 		}
 	}
 }
 
+func (n *Node) becomeLeaderLocked() {
+	n.state = Leader
+	n.nextIndex = make(map[int]int, len(n.peers))
+	n.matchIndex = make(map[int]int, len(n.peers))
+
+	lastLogIndex := len(n.log) - 1
+	for i := range n.peers {
+		n.nextIndex[i] = lastLogIndex + 1
+		n.matchIndex[i] = 0
+	}
+	n.matchIndex[n.id] = lastLogIndex
+}
+
+func (n *Node) becomeFollowerLocked(term int) {
+	if term > n.currentTerm {
+		n.currentTerm = term
+	}
+	n.votedFor = -1
+	n.state = Follower
+}
+
+func (n *Node) replicationWorker(peerIdx int, peerAddr string, trigger <-chan struct{}) {
+	for {
+		select {
+		case <-n.shutdownCh:
+			return
+		case <-trigger:
+			for {
+				if !n.replicateToFollower(peerIdx, peerAddr) {
+					break
+				}
+			}
+		}
+	}
+}
+
+func (n *Node) signalAllReplications() {
+	n.mu.RLock()
+	if n.state != Leader {
+		n.mu.RUnlock()
+		return
+	}
+	chs := make([]chan struct{}, 0, len(n.replicationTrigger))
+	for _, ch := range n.replicationTrigger {
+		chs = append(chs, ch)
+	}
+	n.mu.RUnlock()
+
+	for _, ch := range chs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (n *Node) replicateToFollower(peerIdx int, peerAddr string) bool {
+	n.mu.RLock()
+	if n.state != Leader {
+		n.mu.RUnlock()
+		return false
+	}
+
+	currentTerm := n.currentTerm
+	leaderID := n.id
+	commitIndex := n.commitIndex
+	nextIdx := n.nextIndex[peerIdx]
+	prevLogIndex := nextIdx - 1
+	if prevLogIndex < 0 || prevLogIndex >= len(n.log) {
+		n.mu.RUnlock()
+		return false
+	}
+	prevLogTerm := n.log[prevLogIndex].Term
+
+	entries := make([]LogEntry, 0)
+	if nextIdx < len(n.log) {
+		entries = append(entries, n.log[nextIdx:]...)
+	}
+	n.mu.RUnlock()
+
+	args := &AppendEntriesArgs{
+		Term:         currentTerm,
+		LeaderId:     leaderID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+
+	var reply AppendEntriesReply
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &reply)
+	cancel()
+	if err != nil {
+		return false
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if reply.Term > n.currentTerm {
+		n.becomeFollowerLocked(reply.Term)
+		return false
+	}
+	if n.state != Leader || n.currentTerm != currentTerm {
+		return false
+	}
+
+	if reply.Success {
+		match := prevLogIndex + len(entries)
+		if match > n.matchIndex[peerIdx] {
+			n.matchIndex[peerIdx] = match
+			n.nextIndex[peerIdx] = match + 1
+			n.tryAdvanceCommitIndexLocked()
+		}
+		return n.nextIndex[peerIdx] < len(n.log)
+	}
+
+	if n.nextIndex[peerIdx] > 1 {
+		n.nextIndex[peerIdx]--
+		return true
+	}
+	return false
+}
+
 func (n *Node) tryAdvanceCommitIndex() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.tryAdvanceCommitIndexLocked()
+}
+
+func (n *Node) tryAdvanceCommitIndexLocked() {
 	for N := len(n.log) - 1; N > n.commitIndex; N-- {
 		if n.log[N].Term != n.currentTerm {
 			continue
 		}
 
-		// count self
-		count := 1
+		count := 1 // self
 		for i := range n.peers {
 			if i == n.id {
 				continue
@@ -254,14 +381,12 @@ func (n *Node) tryAdvanceCommitIndex() {
 		if count > len(n.peers)/2 {
 			n.commitIndex = N
 			n.notifyCommitAdvance()
-			log.Printf("[Node %d] Advanced commitIndex to %d", n.id, n.commitIndex)
 			break
 		}
 	}
 }
 
 func (n *Node) notifyCommitAdvance() {
-	// A single pending token is enough; the applier drains until caught up.
 	select {
 	case n.commitNotifyCh <- struct{}{}:
 	default:
@@ -284,134 +409,36 @@ func (n *Node) applyCommittedEntries() {
 
 			n.applyCh <- ApplyMsg{
 				Index:   entry.Index,
+				Term:    entry.Term,
 				Command: entry.Command,
 			}
-		} else {
-			n.mu.Unlock()
-			select {
-			case <-n.shutdownCh:
-				return
-			case <-n.commitNotifyCh:
-			}
-		}
-	}
-}
-
-func (n *Node) sendHeartbeats(stepDownCh chan struct{}) {
-	n.mu.RLock()
-	// can't send heartbeats if node isn't leader
-	if n.state != Leader {
-		n.mu.RUnlock()
-		return
-	}
-
-	// snapshot current state
-	currentTerm := n.currentTerm
-	leaderId := n.id
-	commitIndex := n.commitIndex
-	n.mu.RUnlock()
-
-	for i, peer := range n.peers {
-		if i == n.id {
 			continue
 		}
+		n.mu.Unlock()
 
-		// a goroutine for each peer
-		go func(peerIdx int, peerAddr string) {
-			n.mu.RLock()
-			// double check that we are still the leader
-			if n.state != Leader {
-				n.mu.RUnlock()
-				return
-			}
-
-			nextIdx := n.nextIndex[peerIdx]
-			prevLogIndex := nextIdx - 1
-			prevLogTerm := 0
-
-			if prevLogIndex >= 0 && prevLogIndex < len(n.log) {
-				prevLogTerm = n.log[prevLogIndex].Term
-			}
-
-			// prepare entries to send
-			var entries []LogEntry
-			if nextIdx < len(n.log) {
-				entries = n.log[nextIdx:]
-			}
-			n.mu.RUnlock()
-
-			args := &AppendEntriesArgs{
-				Term:         currentTerm,
-				LeaderId:     leaderId,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: commitIndex,
-			}
-
-			var reply AppendEntriesReply
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			err := n.rpcHandler.AppendEntries(ctx, peerAddr, args, &reply)
-			cancel()
-
-			if err != nil {
-				// we don't need to retry here. the ticker in runLeader() will retry heartbeats
-				log.Printf("[Node %d] Heartbeat to %s failed: %v", n.id, peerAddr, err)
-				return
-			}
-
-			n.mu.Lock()
-			defer n.mu.Unlock()
-
-			// if reply has a higher term, become follower
-			if reply.Term > currentTerm {
-				if n.currentTerm != reply.Term {
-					n.currentTerm = reply.Term
-					n.votedFor = -1
-					n.state = Follower
-
-					// notify the runLeader() function to stop the loop
-					select {
-					case stepDownCh <- struct{}{}:
-					default:
-					}
-				}
-				return
-			}
-
-			// verify state hasn't changed while RPC was in flight
-			if n.state != Leader || n.currentTerm != currentTerm {
-				return
-			}
-
-			if reply.Success {
-				// update indices
-				match := prevLogIndex + len(entries)
-				if match > n.matchIndex[peerIdx] {
-					n.matchIndex[peerIdx] = match
-					n.nextIndex[peerIdx] = match + 1
-					n.tryAdvanceCommitIndex()
-				}
-			} else {
-				// on log inconsistency, decrement nextIndex. since runLeader()
-				// sends heartbeats at intervals, this meets the log matching property
-				if n.nextIndex[peerIdx] > 1 {
-					n.nextIndex[peerIdx]--
-				}
-			}
-		}(i, peer)
+		select {
+		case <-n.shutdownCh:
+			return
+		case <-n.commitNotifyCh:
+		}
 	}
 }
 
 func (n *Node) resetElectionTimer() {
 	timeout := ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
-
 	if n.electionTimer == nil {
 		n.electionTimer = time.NewTimer(timeout)
-	} else {
-		n.electionTimer.Stop()
-		n.electionTimer.Reset(timeout)
+		return
 	}
+
+	// Stop/drain/reset avoids stale timer signals racing with a fresh election timeout.
+	if !n.electionTimer.Stop() {
+		select {
+		case <-n.electionTimer.C:
+		default:
+		}
+	}
+	n.electionTimer.Reset(timeout)
 }
 
 func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -421,36 +448,25 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	reply.Term = n.currentTerm
 	reply.VoteGranted = false
 
-	// don't grant vote if you have a higher term
 	if n.currentTerm > args.Term {
 		return
 	}
 
-	// update term if necessary
 	if args.Term > n.currentTerm {
-		n.currentTerm = args.Term
-		n.votedFor = -1
-		n.state = Follower
+		n.becomeFollowerLocked(args.Term)
 	}
 
 	lastLogIndex := len(n.log) - 1
 	lastLogTerm := n.log[lastLogIndex].Term
 
-	// candidates log term must be at least as high as mine, and if equal their log
-	// must be at least as up to date as mine
 	logOk := (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
-
 	if (n.votedFor == -1 || n.votedFor == args.CandidateId) && logOk {
 		n.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		log.Printf("[Node %d] Granting vote to %d for term %d", n.id, args.CandidateId, args.Term)
-		// Send to vote channel (non-blocking to avoid deadlock)
 		select {
 		case n.voteCh <- true:
 		default:
 		}
-	} else {
-		log.Printf("[Node %d] Rejecting vote for %d term %d (votedFor: %d, logOk: %v)", n.id, args.CandidateId, args.Term, n.votedFor, logOk)
 	}
 }
 
@@ -458,88 +474,68 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// log.Printf("[Node %d] Received heartbeat from Leader %d (Term %d)", n.id, args.LeaderId, args.Term)
-
 	reply.Term = n.currentTerm
 	reply.Success = false
 
-	// reject AppendEntries if leader term is not up to mine
 	if n.currentTerm > args.Term {
 		return
 	}
 
-	// update term if necessary, or step down if we're a leader/candidate
-	if args.Term > n.currentTerm {
-		n.currentTerm = args.Term
-		n.state = Follower
-		n.votedFor = -1
-	} else if args.Term == n.currentTerm {
-		// if we receive AppendEntries from leader with same term, step down
-		if n.state != Follower {
-			n.state = Follower
-		}
+	if args.Term >= n.currentTerm {
+		n.becomeFollowerLocked(args.Term)
 	}
 
-	// Send to heartbeat channel (non-blocking to avoid deadlock)
 	select {
 	case n.heartbeatCh <- true:
 	default:
 	}
 
-	// if our logs don't match, tell the leader
 	if args.PrevLogIndex < 0 {
-		// Initial heartbeat case, PrevLogIndex = -1 is valid
 		reply.Success = true
 	} else if args.PrevLogIndex >= len(n.log) || n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
 
-	// append the entries to my log
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + i + 1
 		if idx < len(n.log) {
-			// if this entry is meant to match with the leader, discard faulty entries and append
 			if n.log[idx].Term != entry.Term {
 				n.log = n.log[:idx]
 				n.log = append(n.log, entry)
 			}
-		} else {
-			n.log = append(n.log, entry)
+			continue
 		}
+		n.log = append(n.log, entry)
 	}
 
-	// update commit index
 	if args.LeaderCommit > n.commitIndex {
 		n.commitIndex = min(args.LeaderCommit, len(n.log)-1)
 		n.notifyCommitAdvance()
 	}
 
-	// successfully appended
 	reply.Success = true
 }
 
 func (n *Node) Submit(cmd Command) (int, int, bool) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	// can only submit to the leader
 	if n.state != Leader {
+		n.mu.Unlock()
 		return -1, -1, false
 	}
 
-	// add this entry to our raft log
 	index := len(n.log)
+	term := n.currentTerm
 	entry := LogEntry{
-		Term:    n.currentTerm,
+		Term:    term,
 		Index:   index,
 		Command: cmd,
 	}
 	n.log = append(n.log, entry)
+	n.matchIndex[n.id] = index
+	n.mu.Unlock()
 
-	go n.sendHeartbeats(n.stepDownCh)
-
-	log.Printf("[Node %d] Appended entry at %d: %+v", n.id, index, cmd)
-	return index, n.currentTerm, true
+	n.signalAllReplications()
+	return index, term, true
 }
 
 func (n *Node) IsLeader() bool {
@@ -556,6 +552,9 @@ func (n *Node) GetState() (int, bool) {
 
 func (n *Node) Shutdown() {
 	n.shutdownOnce.Do(func() {
+		if n.electionTimer != nil {
+			n.electionTimer.Stop()
+		}
 		close(n.shutdownCh)
 	})
 }

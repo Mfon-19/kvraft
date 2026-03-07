@@ -244,8 +244,7 @@ func TestSubmitLeaderOnlyAndAppend(t *testing.T) {
 
 	n.state = Leader
 	n.currentTerm = 5
-	n.stepDownCh = make(chan struct{}, 1)
-	n.becomeLeader()
+	n.becomeLeaderLocked()
 
 	index, term, ok := n.Submit(Command{Type: "put", Key: "k", Value: "v"})
 	if !ok {
@@ -277,14 +276,7 @@ func TestSendHeartbeatsStepDownOnHigherTermReply(t *testing.T) {
 		},
 	}
 
-	stepDownCh := make(chan struct{}, 1)
-	n.sendHeartbeats(stepDownCh)
-
-	select {
-	case <-stepDownCh:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("expected leader to step down after higher term reply")
-	}
+	n.replicateToFollower(1, "peer-1")
 
 	n.mu.RLock()
 	defer n.mu.RUnlock()

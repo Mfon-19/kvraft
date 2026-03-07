@@ -298,20 +298,20 @@ func TestLogMatchingAndConflictRepair(t *testing.T) {
 		},
 	}
 
-	stepDownCh := make(chan struct{}, 1)
-
 	before := make([]LogEntry, len(leader.log))
 	copy(before, leader.log)
 
-	leader.sendHeartbeats(stepDownCh)
-	time.Sleep(80 * time.Millisecond)
-	if leader.nextIndex[1] >= len(leader.log) {
+	leader.replicateToFollower(1, "peer-1")
+	time.Sleep(40 * time.Millisecond)
+	leader.mu.RLock()
+	nextAfterFirst := leader.nextIndex[1]
+	leader.mu.RUnlock()
+	if nextAfterFirst >= len(leader.log) {
 		t.Fatalf("expected nextIndex decrement on initial mismatch")
 	}
 
 	ok := waitForCondition(2*time.Second, func() bool {
-		leader.sendHeartbeats(stepDownCh)
-		time.Sleep(40 * time.Millisecond)
+		leader.replicateToFollower(1, "peer-1")
 		leader.mu.RLock()
 		defer leader.mu.RUnlock()
 		follower.mu.RLock()
@@ -435,21 +435,28 @@ func TestCommitAdvancesOnlyAfterMajorityReplication(t *testing.T) {
 		},
 	}
 
-	stepDownCh := make(chan struct{}, 1)
-	leader.sendHeartbeats(stepDownCh)
-	time.Sleep(100 * time.Millisecond)
+	for i := 1; i < 5; i++ {
+		leader.replicateToFollower(i, fmt.Sprintf("peer-%d", i))
+	}
 
+	leader.mu.RLock()
 	if leader.commitIndex != 0 {
+		leader.mu.RUnlock()
 		t.Fatalf("commit index advanced without majority, commitIndex=%d", leader.commitIndex)
 	}
+	leader.mu.RUnlock()
 
 	successPeers[2] = true
-	leader.sendHeartbeats(stepDownCh)
-	time.Sleep(100 * time.Millisecond)
+	for i := 1; i < 5; i++ {
+		leader.replicateToFollower(i, fmt.Sprintf("peer-%d", i))
+	}
 
+	leader.mu.RLock()
 	if leader.commitIndex != 1 {
+		leader.mu.RUnlock()
 		t.Fatalf("expected commit index to advance with majority, got %d", leader.commitIndex)
 	}
+	leader.mu.RUnlock()
 }
 
 func TestFollowerAppliesCommittedEntriesInOrder(t *testing.T) {
