@@ -3,75 +3,41 @@ package main
 import (
 	"context"
 	"fmt"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	pb "kvraft/proto"
 	"log"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"kvraft/common"
+	pb "kvraft/proto"
 )
 
-type ClientRequest struct {
-	Type  string
-	Key   string
-	Value string
-}
-
-type ClientResponse struct {
-	Success bool
-	Value   string
-	Error   string
-}
-
-func sendRequest(address string, req ClientRequest) (ClientResponse, error) {
+func sendRequest(address string, req common.ClientRequest) (common.ClientResponse, error) {
 	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return ClientResponse{}, err
+		return common.ClientResponse{}, err
 	}
 	defer conn.Close()
 
 	client := pb.NewKVServiceClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-
-	switch req.Type {
-	case "get":
-		resp, err := client.Get(ctx, &pb.KVRequest{Key: req.Key})
-		if err != nil {
-			return ClientResponse{}, err
-		}
-		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
-	case "put":
-		resp, err := client.Put(ctx, &pb.KVRequest{Key: req.Key, Value: req.Value})
-		if err != nil {
-			return ClientResponse{}, err
-		}
-		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
-	case "delete":
-		resp, err := client.Delete(ctx, &pb.KVRequest{Key: req.Key})
-		if err != nil {
-			return ClientResponse{}, err
-		}
-		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
-	default:
-		return ClientResponse{Success: false, Error: "unknown command"}, nil
-	}
+	return common.InvokeKV(ctx, client, req)
 }
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Println("--- Starting Raft-KV Integration Test ---")
 
-	// Allow time for cluster to elect a leader
 	time.Sleep(2 * time.Second)
 
 	addresses := []string{"localhost:8000", "localhost:8001", "localhost:8002"}
 	var leaderAddr string
 
-	// 1. Leader Discovery
 	log.Println("[1/10] Finding leader...")
 	for i := 0; i < 5; i++ {
 		for _, addr := range addresses {
-			resp, err := sendRequest(addr, ClientRequest{Type: "put", Key: "ping", Value: "pong"})
+			resp, err := sendRequest(addr, common.ClientRequest{Type: common.OpPut, Key: "ping", Value: "pong"})
 			if err == nil && resp.Success {
 				leaderAddr = addr
 				log.Printf("\t✓ Leader found at %s", addr)
@@ -88,26 +54,24 @@ func main() {
 		log.Fatal("\t✗ Could not find leader. Is the cluster running?")
 	}
 
-	// 2. Basic Put/Get
 	log.Println("[2/10] Testing Basic Put/Get...")
-	resp, err := sendRequest(leaderAddr, ClientRequest{Type: "put", Key: "foo", Value: "bar"})
+	resp, err := sendRequest(leaderAddr, common.ClientRequest{Type: common.OpPut, Key: "foo", Value: "bar"})
 	if err != nil || !resp.Success {
 		log.Fatalf("\t✗ Put failed: %v", resp.Error)
 	}
 
-	resp, err = sendRequest(leaderAddr, ClientRequest{Type: "get", Key: "foo"})
+	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
 	if err != nil || resp.Value != "bar" {
 		log.Fatalf("\t✗ Get failed. Expected 'bar', got '%s'", resp.Value)
 	}
 	log.Println("\t✓ Basic Put/Get passed")
 
-	// 3. Replication Check
 	log.Println("[3/10] Verifying Replication...")
 	time.Sleep(10 * time.Second)
 
 	successCount := 0
 	for _, addr := range addresses {
-		resp, _ := sendRequest(addr, ClientRequest{Type: "get", Key: "foo"})
+		resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
 		if resp.Success && resp.Value == "bar" {
 			successCount++
 		}
@@ -117,51 +81,46 @@ func main() {
 	}
 	log.Printf("\t✓ Data present on %d/3 nodes", successCount)
 
-	// 4. Sequential Writes
 	log.Println("[4/10] Sequential Writes...")
 	for i := 0; i < 5; i++ {
 		k, v := fmt.Sprintf("seq-%d", i), fmt.Sprintf("val-%d", i)
-		if _, err := sendRequest(leaderAddr, ClientRequest{Type: "put", Key: k, Value: v}); err != nil {
+		if _, err := sendRequest(leaderAddr, common.ClientRequest{Type: common.OpPut, Key: k, Value: v}); err != nil {
 			log.Fatalf("\t✗ Write failed at index %d", i)
 		}
 	}
 	log.Println("\t✓ 5 Sequential writes successful")
 
-	// 5. Update Key
 	log.Println("[5/10] Updating Keys...")
-	sendRequest(leaderAddr, ClientRequest{Type: "put", Key: "foo", Value: "updated"})
-	resp, _ = sendRequest(leaderAddr, ClientRequest{Type: "get", Key: "foo"})
+	sendRequest(leaderAddr, common.ClientRequest{Type: common.OpPut, Key: "foo", Value: "updated"})
+	resp, _ = sendRequest(leaderAddr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
 	if resp.Value != "updated" {
 		log.Fatalf("\t✗ Update failed. Got %s", resp.Value)
 	}
 	log.Println("\t✓ Key updated successfully")
 
-	// 6. Delete Key
 	log.Println("[6/10] Deleting Keys...")
-	sendRequest(leaderAddr, ClientRequest{Type: "delete", Key: "foo"})
-	resp, _ = sendRequest(leaderAddr, ClientRequest{Type: "get", Key: "foo"})
+	sendRequest(leaderAddr, common.ClientRequest{Type: common.OpDelete, Key: "foo"})
+	resp, _ = sendRequest(leaderAddr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
 	if resp.Success {
 		log.Fatal("\t✗ Key should be deleted but was found")
 	}
 	log.Println("\t✓ Key deleted")
 
-	// 7. Verify Delete Replication
 	log.Println("[7/10] Verifying Delete Replication...")
 	time.Sleep(600 * time.Millisecond)
 	for _, addr := range addresses {
-		resp, _ := sendRequest(addr, ClientRequest{Type: "get", Key: "foo"})
+		resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
 		if resp.Success {
 			log.Fatalf("\t✗ Node %s still has deleted key", addr)
 		}
 	}
 	log.Println("\t✓ Delete replicated to all nodes")
 
-	// 8. Write to Follower (Expect Failure)
 	log.Println("[8/10] Testing Follower Rejection...")
 	checkedFollower := false
 	for _, addr := range addresses {
 		if addr != leaderAddr {
-			resp, _ := sendRequest(addr, ClientRequest{Type: "put", Key: "bad", Value: "data"})
+			resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpPut, Key: "bad", Value: "data"})
 			if !resp.Success && resp.Error == "not leader" {
 				checkedFollower = true
 				break
@@ -174,28 +133,26 @@ func main() {
 		log.Println("\t✓ Follower correctly rejected write")
 	}
 
-	// 9. Throughput Test
 	log.Println("[9/10] High-Throughput Test (100 Writes)...")
 	start := time.Now()
 	total := 100
 	ok := 0
 	for i := 0; i < total; i++ {
 		k := fmt.Sprintf("bench-%d", i)
-		if resp, _ := sendRequest(leaderAddr, ClientRequest{Type: "put", Key: k, Value: "x"}); resp.Success {
+		if resp, _ := sendRequest(leaderAddr, common.ClientRequest{Type: common.OpPut, Key: k, Value: "x"}); resp.Success {
 			ok++
 		}
 	}
 	duration := time.Since(start)
 	log.Printf("\t✓ %d/%d writes succeeded in %v (%.0f req/sec)", ok, total, duration, float64(ok)/duration.Seconds())
 
-	// 10. Final Consistency
 	log.Println("[10/10] Final Consistency Check...")
-	time.Sleep(1 * time.Second) // Allow full propagation
+	time.Sleep(1 * time.Second)
 
-	testKey := "bench-99" // Check the last written key
+	testKey := "bench-99"
 	consistent := 0
 	for _, addr := range addresses {
-		resp, _ := sendRequest(addr, ClientRequest{Type: "get", Key: testKey})
+		resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: testKey})
 		if resp.Success && resp.Value == "x" {
 			consistent++
 		}
