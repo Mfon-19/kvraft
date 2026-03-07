@@ -1,6 +1,9 @@
 # OS artifacts
 .DS_Store
 
+# IDE artifacts
+.idea/
+
 # Legacy local test data
 cmd/testdb/
 
@@ -15,3 +18,9 @@ cmd/testdb/
 # Runtime and integration-test artifacts
 /node*.log
 /kvstore_[0-9]*/
+
+# Local benchmark and scratch artifacts
+/benchmark-artifacts/
+/newdir/
+/main.py
+/sample.txt
