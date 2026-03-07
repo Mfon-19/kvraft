@@ -397,6 +397,126 @@ func (x *Command) GetValue() string {
 	return ""
 }
 
+type KVRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KVRequest) Reset() {
+	*x = KVRequest{}
+	mi := &file_proto_raft_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KVRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KVRequest) ProtoMessage() {}
+
+func (x *KVRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KVRequest.ProtoReflect.Descriptor instead.
+func (*KVRequest) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *KVRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *KVRequest) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
+type KVResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Value         string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	Leader        string                 `protobuf:"bytes,4,opt,name=leader,proto3" json:"leader,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KVResponse) Reset() {
+	*x = KVResponse{}
+	mi := &file_proto_raft_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KVResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KVResponse) ProtoMessage() {}
+
+func (x *KVResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KVResponse.ProtoReflect.Descriptor instead.
+func (*KVResponse) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *KVResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *KVResponse) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
+func (x *KVResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *KVResponse) GetLeader() string {
+	if x != nil {
+		return x.Leader
+	}
+	return ""
+}
+
 var File_proto_raft_proto protoreflect.FileDescriptor
 
 const file_proto_raft_proto_rawDesc = "" +
@@ -427,10 +547,23 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\aCommand\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x03 \x01(\tR\x05value2\x9b\x01\n" +
+	"\x05value\x18\x03 \x01(\tR\x05value\"3\n" +
+	"\tKVRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"j\n" +
+	"\n" +
+	"KVResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12\x16\n" +
+	"\x06leader\x18\x04 \x01(\tR\x06leader2\x9b\x01\n" +
 	"\vRaftService\x12B\n" +
 	"\vRequestVote\x12\x18.raft.RequestVoteRequest\x1a\x19.raft.RequestVoteResponse\x12H\n" +
-	"\rAppendEntries\x12\x1a.raft.AppendEntriesRequest\x1a\x1b.raft.AppendEntriesResponseB\x0eZ\fkvraft/protob\x06proto3"
+	"\rAppendEntries\x12\x1a.raft.AppendEntriesRequest\x1a\x1b.raft.AppendEntriesResponse2\x8c\x01\n" +
+	"\tKVService\x12(\n" +
+	"\x03Get\x12\x0f.raft.KVRequest\x1a\x10.raft.KVResponse\x12(\n" +
+	"\x03Put\x12\x0f.raft.KVRequest\x1a\x10.raft.KVResponse\x12+\n" +
+	"\x06Delete\x12\x0f.raft.KVRequest\x1a\x10.raft.KVResponseB\x0eZ\fkvraft/protob\x06proto3"
 
 var (
 	file_proto_raft_proto_rawDescOnce sync.Once
@@ -444,7 +577,7 @@ func file_proto_raft_proto_rawDescGZIP() []byte {
 	return file_proto_raft_proto_rawDescData
 }
 
-var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_proto_raft_proto_goTypes = []any{
 	(*RequestVoteRequest)(nil),    // 0: raft.RequestVoteRequest
 	(*RequestVoteResponse)(nil),   // 1: raft.RequestVoteResponse
@@ -452,16 +585,24 @@ var file_proto_raft_proto_goTypes = []any{
 	(*AppendEntriesResponse)(nil), // 3: raft.AppendEntriesResponse
 	(*LogEntry)(nil),              // 4: raft.LogEntry
 	(*Command)(nil),               // 5: raft.Command
+	(*KVRequest)(nil),             // 6: raft.KVRequest
+	(*KVResponse)(nil),            // 7: raft.KVResponse
 }
 var file_proto_raft_proto_depIdxs = []int32{
 	4, // 0: raft.AppendEntriesRequest.entries:type_name -> raft.LogEntry
 	5, // 1: raft.LogEntry.command:type_name -> raft.Command
 	0, // 2: raft.RaftService.RequestVote:input_type -> raft.RequestVoteRequest
 	2, // 3: raft.RaftService.AppendEntries:input_type -> raft.AppendEntriesRequest
-	1, // 4: raft.RaftService.RequestVote:output_type -> raft.RequestVoteResponse
-	3, // 5: raft.RaftService.AppendEntries:output_type -> raft.AppendEntriesResponse
-	4, // [4:6] is the sub-list for method output_type
-	2, // [2:4] is the sub-list for method input_type
+	6, // 4: raft.KVService.Get:input_type -> raft.KVRequest
+	6, // 5: raft.KVService.Put:input_type -> raft.KVRequest
+	6, // 6: raft.KVService.Delete:input_type -> raft.KVRequest
+	1, // 7: raft.RaftService.RequestVote:output_type -> raft.RequestVoteResponse
+	3, // 8: raft.RaftService.AppendEntries:output_type -> raft.AppendEntriesResponse
+	7, // 9: raft.KVService.Get:output_type -> raft.KVResponse
+	7, // 10: raft.KVService.Put:output_type -> raft.KVResponse
+	7, // 11: raft.KVService.Delete:output_type -> raft.KVResponse
+	7, // [7:12] is the sub-list for method output_type
+	2, // [2:7] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name
 	2, // [2:2] is the sub-list for extension extendee
 	0, // [0:2] is the sub-list for field type_name
@@ -478,9 +619,9 @@ func file_proto_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_raft_proto_rawDesc), len(file_proto_raft_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_proto_raft_proto_goTypes,
 		DependencyIndexes: file_proto_raft_proto_depIdxs,

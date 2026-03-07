@@ -2,9 +2,9 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"kvraft/kvstore"
 	pb "kvraft/proto"
 	"kvraft/raft"
@@ -22,7 +22,9 @@ type RaftKVServer struct {
 	raftNode    *raft.Node
 	store       *kvstore.DB
 	grpcServer  *grpc.Server
+	clientGRPC  *grpc.Server
 	listener    net.Listener
+	clientLn    net.Listener
 	pending     map[int]chan string
 	pendingLock sync.Mutex
 }
@@ -35,7 +37,11 @@ func NewRaftKVServer(id int, address string, peers []string) *RaftKVServer {
 	}
 
 	dir := fmt.Sprintf("kvstore_%d", id)
-	open, err := kvstore.Open(dir)
+	open, err := kvstore.OpenWithOptions(dir, kvstore.OpenOptions{
+		ReadWrite:            true,
+		SyncOnPut:            false,
+		MaxDataFileSizeBytes: 64 * 1024 * 1024,
+	})
 	if err != nil {
 		return nil
 	}
@@ -134,16 +140,16 @@ func (s *RaftKVServer) Put(key, value string) error {
 	s.pending[index] = ch
 	s.pendingLock.Unlock()
 
-        select {
-        case <-ch:
-                // command applied
-                return nil
-        case <-time.After(5 * time.Second):
-                s.pendingLock.Lock()
-                delete(s.pending, index)
-                s.pendingLock.Unlock()
-                return fmt.Errorf("put command timed out waiting for commit")
-        }
+	select {
+	case <-ch:
+		// command applied
+		return nil
+	case <-time.After(5 * time.Second):
+		s.pendingLock.Lock()
+		delete(s.pending, index)
+		s.pendingLock.Unlock()
+		return fmt.Errorf("put command timed out waiting for commit")
+	}
 }
 
 func (s *RaftKVServer) Delete(key string) error {
@@ -162,15 +168,15 @@ func (s *RaftKVServer) Delete(key string) error {
 	s.pending[index] = ch
 	s.pendingLock.Unlock()
 
-        select {
-        case <-ch:
-                return nil
-        case <-time.After(5 * time.Second):
-                s.pendingLock.Lock()
-                delete(s.pending, index)
-                s.pendingLock.Unlock()
-                return fmt.Errorf("delete command timed out waiting for commit")
-        }
+	select {
+	case <-ch:
+		return nil
+	case <-time.After(5 * time.Second):
+		s.pendingLock.Lock()
+		delete(s.pending, index)
+		s.pendingLock.Unlock()
+		return fmt.Errorf("delete command timed out waiting for commit")
+	}
 }
 
 func (s *RaftKVServer) IsLeader() bool {
@@ -179,11 +185,26 @@ func (s *RaftKVServer) IsLeader() bool {
 
 func (s *RaftKVServer) Close() {
 	s.raftNode.Shutdown()
+	if s.grpcServer != nil {
+		s.grpcServer.GracefulStop()
+	}
+	if s.clientGRPC != nil {
+		s.clientGRPC.GracefulStop()
+	}
+	if s.store != nil {
+		if err := s.store.Close(); err != nil {
+			log.Printf("[Server %d] Error closing kv store: %v", s.id, err)
+		}
+	}
 	if s.listener != nil {
 		err := s.listener.Close()
 		if err != nil {
 			log.Printf("[Server %d] Error closing server", s.id)
-			return
+		}
+	}
+	if s.clientLn != nil {
+		if err := s.clientLn.Close(); err != nil {
+			log.Printf("[Server %d] Error closing client server", s.id)
 		}
 	}
 }
@@ -207,6 +228,33 @@ func (g *GRPCRaftService) AppendEntries(ctx context.Context, req *pb.AppendEntri
 	return raft.AppendEntriesReplyToProto(reply), nil
 }
 
+type GRPCKVService struct {
+	pb.UnimplementedKVServiceServer
+	server *RaftKVServer
+}
+
+func (g *GRPCKVService) Get(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
+	value, err := g.server.Get(req.Key)
+	if err != nil {
+		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
+	}
+	return &pb.KVResponse{Success: true, Value: string(value)}, nil
+}
+
+func (g *GRPCKVService) Put(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
+	if err := g.server.Put(req.Key, req.Value); err != nil {
+		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
+	}
+	return &pb.KVResponse{Success: true}, nil
+}
+
+func (g *GRPCKVService) Delete(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
+	if err := g.server.Delete(req.Key); err != nil {
+		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
+	}
+	return &pb.KVResponse{Success: true}, nil
+}
+
 type GRPCClient struct {
 	peers []string
 	conns map[string]*grpc.ClientConn
@@ -227,7 +275,7 @@ func (c *GRPCClient) getConnection(target string) (*grpc.ClientConn, error) {
 	}
 
 	// if not connected, connect asynchronously (no WithBlock to avoid timeout issues)
-	conn, err := grpc.Dial(target, grpc.WithInsecure())
+	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("[GRPCClient] Error dialing server %s: %v", target, err)
 		return nil, err
@@ -319,39 +367,17 @@ func (s *RaftKVServer) StartClientListener(clientPort string) error {
 		log.Printf("[Server %d] Error listening on port %s", s.id, clientPort)
 		return err
 	}
+	s.clientLn = listener
+	s.clientGRPC = grpc.NewServer()
+	pb.RegisterKVServiceServer(s.clientGRPC, &GRPCKVService{server: s})
 
 	log.Printf("[Server %d] Client listener on %s", s.id, clientPort)
 
 	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("[Server %d] Error accepting client connection", s.id)
-				return
-			}
-			// one goroutine per client connection
-			go s.handleClientConn(conn)
+		if err := s.clientGRPC.Serve(listener); err != nil {
+			log.Printf("[Server %d] Client gRPC server error: %v", s.id, err)
 		}
 	}()
 
 	return nil
-}
-
-func (s *RaftKVServer) handleClientConn(conn net.Conn) {
-	defer conn.Close()
-
-	decoder := json.NewDecoder(conn)
-	encoder := json.NewEncoder(conn)
-
-	for {
-		var req ClientRequest
-		if err := decoder.Decode(&req); err != nil {
-			return
-		}
-
-		resp := s.HandleClientRequest(req)
-		if err := encoder.Encode(&resp); err != nil {
-			return
-		}
-	}
 }

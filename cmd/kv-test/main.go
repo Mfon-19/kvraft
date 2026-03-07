@@ -1,10 +1,12 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	pb "kvraft/proto"
 	"log"
-	"net"
 	"time"
 )
 
@@ -21,26 +23,38 @@ type ClientResponse struct {
 }
 
 func sendRequest(address string, req ClientRequest) (ClientResponse, error) {
-	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
+	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return ClientResponse{}, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
 	defer conn.Close()
 
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
+	client := pb.NewKVServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
 
-	if err := encoder.Encode(&req); err != nil {
-		return ClientResponse{}, err
+	switch req.Type {
+	case "get":
+		resp, err := client.Get(ctx, &pb.KVRequest{Key: req.Key})
+		if err != nil {
+			return ClientResponse{}, err
+		}
+		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
+	case "put":
+		resp, err := client.Put(ctx, &pb.KVRequest{Key: req.Key, Value: req.Value})
+		if err != nil {
+			return ClientResponse{}, err
+		}
+		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
+	case "delete":
+		resp, err := client.Delete(ctx, &pb.KVRequest{Key: req.Key})
+		if err != nil {
+			return ClientResponse{}, err
+		}
+		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
+	default:
+		return ClientResponse{Success: false, Error: "unknown command"}, nil
 	}
-
-	var resp ClientResponse
-	if err := decoder.Decode(&resp); err != nil {
-		return ClientResponse{}, err
-	}
-
-	return resp, nil
 }
 
 func main() {
@@ -55,13 +69,20 @@ func main() {
 
 	// 1. Leader Discovery
 	log.Println("[1/10] Finding leader...")
-	for _, addr := range addresses {
-		resp, err := sendRequest(addr, ClientRequest{Type: "put", Key: "ping", Value: "pong"})
-		if err == nil && resp.Success {
-			leaderAddr = addr
-			log.Printf("\t✓ Leader found at %s", addr)
+	for i := 0; i < 5; i++ {
+		for _, addr := range addresses {
+			resp, err := sendRequest(addr, ClientRequest{Type: "put", Key: "ping", Value: "pong"})
+			if err == nil && resp.Success {
+				leaderAddr = addr
+				log.Printf("\t✓ Leader found at %s", addr)
+				break
+			}
+		}
+		if leaderAddr != "" {
 			break
 		}
+		time.Sleep(1 * time.Second)
+		log.Printf("\t... Retrying leader discovery (%d/5)", i+1)
 	}
 	if leaderAddr == "" {
 		log.Fatal("\t✗ Could not find leader. Is the cluster running?")

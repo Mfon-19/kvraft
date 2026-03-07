@@ -14,7 +14,7 @@ import (
 func main() {
 	// command line flags
 	id := flag.Int("id", 0, "Node Id")
-	port := flag.Int("port", 5000, "Raft RPC port")
+	port := flag.Int("port", 6000, "Raft RPC port")
 	clientPort := flag.Int("client-port", 8000, "Client request port")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peer addresses (e.g., localhost:5001,localhost:5002)")
 	flag.Parse()

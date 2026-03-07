@@ -68,7 +68,7 @@ find_available_port() {
 echo "Scanning for available ports..."
 
 # Raft RPC ports (starting from 5000)
-RAFT_PORT_0=$(find_available_port 5000)
+RAFT_PORT_0=$(find_available_port 6000)
 RAFT_PORT_1=$(find_available_port $((RAFT_PORT_0 + 1)))
 RAFT_PORT_2=$(find_available_port $((RAFT_PORT_1 + 1)))
 
