@@ -60,7 +60,7 @@ func TestPutGetOverwriteAndReopen(t *testing.T) {
 	}
 }
 
-func TestOpenDefaultsToReadOnly(t *testing.T) {
+func TestOpenDefaultsToReadWrite(t *testing.T) {
 	dir := t.TempDir()
 
 	db, err := Open(dir)
@@ -69,8 +69,8 @@ func TestOpenDefaultsToReadOnly(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put("k", "v"); !errors.Is(err, ErrReadOnly) {
-		t.Fatalf("expected ErrReadOnly from default open put, got %v", err)
+	if err := db.Put("k", "v"); err != nil {
+		t.Fatalf("expected writable default open, got %v", err)
 	}
 }
 
