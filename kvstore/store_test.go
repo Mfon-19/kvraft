@@ -60,6 +60,20 @@ func TestPutGetOverwriteAndReopen(t *testing.T) {
 	}
 }
 
+func TestOpenDefaultsToReadOnly(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open default: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Put("k", "v"); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("expected ErrReadOnly from default open put, got %v", err)
+	}
+}
+
 func TestCRCDetectionOnGet(t *testing.T) {
 	dir := t.TempDir()
 	db := openWritable(t, dir, defaultMaxDataFileSize, false)
@@ -254,6 +268,58 @@ func TestActiveTailTruncationRecovery(t *testing.T) {
 	}
 	if recoveredStat.Size() != originalSize {
 		t.Fatalf("expected truncated size %d got %d", originalSize, recoveredStat.Size())
+	}
+}
+
+func TestActiveScanCRCErrorDoesNotTruncate(t *testing.T) {
+	dir := t.TempDir()
+	db := openWritable(t, dir, defaultMaxDataFileSize, false)
+	if err := db.Put("a", "value-a"); err != nil {
+		t.Fatalf("put a: %v", err)
+	}
+	if err := db.Put("b", "value-b"); err != nil {
+		t.Fatalf("put b: %v", err)
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	activePath := dataFilePath(dir, db.activeFileID)
+	statBefore, err := os.Stat(activePath)
+	if err != nil {
+		t.Fatalf("stat active before close: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	f, err := os.OpenFile(activePath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open active: %v", err)
+	}
+	orig := make([]byte, 1)
+	if _, err := f.ReadAt(orig, 0); err != nil {
+		f.Close()
+		t.Fatalf("read crc byte: %v", err)
+	}
+	if _, err := f.WriteAt([]byte{orig[0] ^ 0xFF}, 0); err != nil {
+		f.Close()
+		t.Fatalf("flip crc byte: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	if _, err := OpenWithOptions(dir, OpenOptions{ReadWrite: true}); !errors.Is(err, ErrCorruptData) {
+		t.Fatalf("expected ErrCorruptData on startup scan got %v", err)
+	}
+
+	statAfter, err := os.Stat(activePath)
+	if err != nil {
+		t.Fatalf("stat active after reopen failure: %v", err)
+	}
+	if statAfter.Size() != statBefore.Size() {
+		t.Fatalf("expected active file size unchanged at %d, got %d", statBefore.Size(), statAfter.Size())
 	}
 }
 

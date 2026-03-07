@@ -89,7 +89,7 @@ type mergeFile struct {
 }
 
 func Open(dir string) (*DB, error) {
-	return OpenWithOptions(dir, OpenOptions{})
+	return OpenWithOptions(dir, OpenOptions{ReadWrite: false})
 }
 
 func OpenReadOnly(dir string) (*DB, error) {
@@ -300,7 +300,7 @@ func (db *DB) scanDataFile(fileID uint64, allowTailTruncate bool) error {
 			return nil
 		}
 		if err != nil {
-			if allowTailTruncate {
+			if allowTailTruncate && isTailTruncationError(err) {
 				// If the writer crashed mid-record, trim the active file to the last complete entry.
 				if truncErr := f.Truncate(lastGoodOffset); truncErr != nil {
 					return truncErr
@@ -313,7 +313,13 @@ func (db *DB) scanDataFile(fileID uint64, allowTailTruncate bool) error {
 				}
 				return nil
 			}
-			return ErrCorruptData
+			if errors.Is(err, ErrCorruptData) {
+				return ErrCorruptData
+			}
+			if !allowTailTruncate {
+				return ErrCorruptData
+			}
+			return err
 		}
 
 		entry := KeyDirEntry{
@@ -327,6 +333,10 @@ func (db *DB) scanDataFile(fileID uint64, allowTailTruncate bool) error {
 		offset += int64(size)
 		lastGoodOffset = offset
 	}
+}
+
+func isTailTruncationError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // applyKeydirUpdate resolves duplicates with Bitcask ordering: newer timestamp wins,
