@@ -46,7 +46,7 @@ jobs:
             -etcd-read-keyspace 500 \
             -etcd-payload-bytes 128 \
             -etcd-light-ops 50 \
-            -etcd-disk-fsync-samples 50 \
+            -etcd-disk-fsync-samples 200 \
             -etcd-disk-commit-samples 30 \
             -etcd-disk-commit-batch 16 \
             -writes 120 \
