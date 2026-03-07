@@ -275,6 +275,35 @@ Bitcask is a log-structured storage engine designed for fast key-value operation
 - **Leader Election**: <300ms failover time
 - **Fault Tolerance**: Survives minority failures (up to N/2 - 1 nodes)
 
+## Benchmarking Claims
+
+To validate claims like:
+- p99 write latency `<10ms` on a 3-node Raft cluster
+- restart recovery and disk usage improvements from hint indexing + merge compaction
+
+use the benchmark runner:
+
+```bash
+go build -o kv-server ./cmd/kv-server
+go run ./cmd/kv-bench -server-bin ./kv-server -strict
+```
+
+`kv-bench` will:
+- start an isolated 3-node cluster in a temporary working directory
+- measure write latency percentiles and replication convergence
+- build a synthetic Bitcask dataset, then compare restart/open time and disk usage across:
+  - no hints (baseline)
+  - hints only
+  - hints + merge compaction
+- print a JSON report and target pass/fail summary
+
+Useful flags:
+- `-writes` number of latency writes
+- `-p99-target-ms` p99 threshold
+- `-dataset-keys`, `-dataset-rounds`, `-dataset-payload-bytes` storage benchmark scale
+- `-disk-reduction-min`, `-disk-reduction-max` expected compaction range
+- `-keep-artifacts` to retain node logs and benchmark data
+
 ## Use Cases
 
 **When to Use Raft-KV:**
@@ -314,6 +343,11 @@ This is an educational implementation demonstrating core concepts:
 
 ```
 raft-kv/
+├── cmd/
+│   ├── kv-server/          # Server binary entrypoint
+│   ├── kv-client/          # CLI client entrypoint
+│   ├── kv-test/            # End-to-end integration smoke runner
+│   └── kv-bench/           # Automated latency/recovery/disk benchmark runner
 ├── proto/
 │   └── raft.proto          # gRPC service definitions
 ├── raft/
@@ -323,9 +357,7 @@ raft-kv/
 │   └── store.go            # Bitcask storage engine
 ├── server/
 │   └── server.go           # gRPC server + glue logic
-├── main.go                 # Entry point
-├── client.go               # CLI client
-└── test.go                 # Integration tests
+└── run_cluster.sh          # Helper script for local manual cluster runs
 ```
 
 ## Further Reading

@@ -9,7 +9,8 @@ import (
 )
 
 type Node struct {
-	mu sync.RWMutex
+	mu           sync.RWMutex
+	shutdownOnce sync.Once
 
 	// server identity and peer addresses
 	id    int
@@ -31,11 +32,13 @@ type Node struct {
 	stepDownCh chan struct{}
 
 	// channels
-	applyCh       chan ApplyMsg
-	heartbeatCh   chan bool
-	voteCh        chan bool
-	shutdownCh    chan struct{}
-	electionTimer *time.Timer
+	applyCh chan ApplyMsg
+	// commitNotifyCh coalesces commit-index advances so the applier can wake without polling.
+	commitNotifyCh chan struct{}
+	heartbeatCh    chan bool
+	voteCh         chan bool
+	shutdownCh     chan struct{}
+	electionTimer  *time.Timer
 
 	rpcHandler RPCHandler
 	rpcTimeout time.Duration
@@ -48,20 +51,21 @@ type RPCHandler interface {
 
 func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandler) *Node {
 	n := &Node{
-		id:          id,
-		peers:       peers,
-		currentTerm: 0,
-		votedFor:    -1, // voted for no one yet
-		log:         make([]LogEntry, 1),
-		commitIndex: 0,
-		lastApplied: 0,
-		state:       Follower, // every raft node starts out as a follower
-		applyCh:     applyCh,
-		heartbeatCh: make(chan bool, 100),
-		voteCh:      make(chan bool, 100),
-		shutdownCh:  make(chan struct{}),
-		rpcHandler:  rpcHandler,
-		rpcTimeout:  2 * time.Second,
+		id:             id,
+		peers:          peers,
+		currentTerm:    0,
+		votedFor:       -1, // voted for no one yet
+		log:            make([]LogEntry, 1),
+		commitIndex:    0,
+		lastApplied:    0,
+		state:          Follower, // every raft node starts out as a follower
+		applyCh:        applyCh,
+		commitNotifyCh: make(chan struct{}, 1),
+		heartbeatCh:    make(chan bool, 100),
+		voteCh:         make(chan bool, 100),
+		shutdownCh:     make(chan struct{}),
+		rpcHandler:     rpcHandler,
+		rpcTimeout:     2 * time.Second,
 	}
 
 	// dummy entry
@@ -144,12 +148,14 @@ func (n *Node) runCandidate() {
 
 		go func(peerAddr string) {
 			var reply RequestVoteReply
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
 
 			err := n.rpcHandler.RequestVote(ctx, peerAddr, args, &reply)
 			if err == nil {
 				voteCh <- reply
+			} else {
+				log.Printf("[Node %d] RequestVote RPC to %s failed: %v", n.id, peerAddr, err)
 			}
 		}(peer)
 	}
@@ -247,14 +253,29 @@ func (n *Node) tryAdvanceCommitIndex() {
 
 		if count > len(n.peers)/2 {
 			n.commitIndex = N
+			n.notifyCommitAdvance()
 			log.Printf("[Node %d] Advanced commitIndex to %d", n.id, n.commitIndex)
 			break
 		}
 	}
 }
 
+func (n *Node) notifyCommitAdvance() {
+	// A single pending token is enough; the applier drains until caught up.
+	select {
+	case n.commitNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
 func (n *Node) applyCommittedEntries() {
 	for {
+		select {
+		case <-n.shutdownCh:
+			return
+		default:
+		}
+
 		n.mu.Lock()
 		if n.lastApplied < n.commitIndex {
 			n.lastApplied++
@@ -267,7 +288,11 @@ func (n *Node) applyCommittedEntries() {
 			}
 		} else {
 			n.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			select {
+			case <-n.shutdownCh:
+				return
+			case <-n.commitNotifyCh:
+			}
 		}
 	}
 }
@@ -418,11 +443,14 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	if (n.votedFor == -1 || n.votedFor == args.CandidateId) && logOk {
 		n.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		log.Printf("[Node %d] Granting vote to %d for term %d", n.id, args.CandidateId, args.Term)
 		// Send to vote channel (non-blocking to avoid deadlock)
 		select {
 		case n.voteCh <- true:
 		default:
 		}
+	} else {
+		log.Printf("[Node %d] Rejecting vote for %d term %d (votedFor: %d, logOk: %v)", n.id, args.CandidateId, args.Term, n.votedFor, logOk)
 	}
 }
 
@@ -483,6 +511,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	// update commit index
 	if args.LeaderCommit > n.commitIndex {
 		n.commitIndex = min(args.LeaderCommit, len(n.log)-1)
+		n.notifyCommitAdvance()
 	}
 
 	// successfully appended
@@ -526,5 +555,7 @@ func (n *Node) GetState() (int, bool) {
 }
 
 func (n *Node) Shutdown() {
-	close(n.shutdownCh)
+	n.shutdownOnce.Do(func() {
+		close(n.shutdownCh)
+	})
 }

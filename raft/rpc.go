@@ -72,8 +72,8 @@ func (s NodeState) String() string {
 
 const (
 	HeartbeatInterval  = 150 * time.Millisecond
-	ElectionTimeoutMin = 300 * time.Millisecond
-	ElectionTimeoutMax = 600 * time.Millisecond
+	ElectionTimeoutMin = 500 * time.Millisecond
+	ElectionTimeoutMax = 1000 * time.Millisecond
 )
 
 func RequestVoteArgsToProto(args *RequestVoteArgs) *pb.RequestVoteRequest {

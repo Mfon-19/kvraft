@@ -1,2 +1,17 @@
-cmd/testdb
-cmd/.DS_Store
+# OS artifacts
+.DS_Store
+
+# Legacy local test data
+cmd/testdb/
+
+# Generated binaries (project root)
+/client
+/kv-client
+/kv-server
+/kv-test
+/kv-bench
+/raft-kv
+
+# Runtime and integration-test artifacts
+/node*.log
+/kvstore_[0-9]*/

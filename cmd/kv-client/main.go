@@ -2,26 +2,28 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	pb "kvraft/proto"
 	"log"
-	"net"
 	"os"
 	"strings"
-
-	"kvraft/common"
+	"time"
 )
 
 func main() {
 	address := flag.String("address", "localhost:8000", "Server address")
 	flag.Parse()
 
-	conn, err := net.Dial("tcp", *address)
+	conn, err := grpc.Dial(*address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Failed to connect to server at %s: %v\n", *address, err)
 	}
 	defer conn.Close()
+	client := pb.NewKVServiceClient(conn)
 
 	fmt.Println("╔════════════════════════════════════════════════════╗")
 	fmt.Println("║         Raft-KV Client (with gRPC backend)         ║")
@@ -34,9 +36,6 @@ func main() {
 	fmt.Println("  help               - Show this help message")
 	fmt.Println("  quit / exit        - Exit the client")
 	fmt.Println()
-
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -72,15 +71,11 @@ func main() {
 				fmt.Println("Usage: put <key> <value>")
 				continue
 			}
-			req := common.ClientRequest{Type: "put", Key: parts[1], Value: parts[2]}
-			if err := encoder.Encode(&req); err != nil {
-				log.Printf("Error sending request: %v", err)
-				return
-			}
-
-			var resp common.ClientResponse
-			if err := decoder.Decode(&resp); err != nil {
-				log.Printf("Error receiving response: %v", err)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := client.Put(ctx, &pb.KVRequest{Key: parts[1], Value: parts[2]})
+			cancel()
+			if err != nil {
+				log.Printf("RPC error: %v", err)
 				return
 			}
 
@@ -98,15 +93,11 @@ func main() {
 				fmt.Println("Usage: get <key>")
 				continue
 			}
-			req := common.ClientRequest{Type: "get", Key: parts[1]}
-			if err := encoder.Encode(&req); err != nil {
-				log.Printf("Error sending request: %v", err)
-				return
-			}
-
-			var resp common.ClientResponse
-			if err := decoder.Decode(&resp); err != nil {
-				log.Printf("Error receiving response: %v", err)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := client.Get(ctx, &pb.KVRequest{Key: parts[1]})
+			cancel()
+			if err != nil {
+				log.Printf("RPC error: %v", err)
 				return
 			}
 
@@ -121,15 +112,11 @@ func main() {
 				fmt.Println("Usage: delete <key>")
 				continue
 			}
-			req := common.ClientRequest{Type: "delete", Key: parts[1]}
-			if err := encoder.Encode(&req); err != nil {
-				log.Printf("Error sending request: %v", err)
-				return
-			}
-
-			var resp common.ClientResponse
-			if err := decoder.Decode(&resp); err != nil {
-				log.Printf("Error receiving response: %v", err)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := client.Delete(ctx, &pb.KVRequest{Key: parts[1]})
+			cancel()
+			if err != nil {
+				log.Printf("RPC error: %v", err)
 				return
 			}
 

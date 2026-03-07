@@ -47,6 +47,23 @@ service RaftService {
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
 }
 
+message KVRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message KVResponse {
+  bool success = 1;
+  string value = 2;
+  string error = 3;
+  string leader = 4;
+}
+
+service KVService {
+  rpc Get(KVRequest) returns (KVResponse);
+  rpc Put(KVRequest) returns (KVResponse);
+  rpc Delete(KVRequest) returns (KVResponse);
+}
 
 
 
