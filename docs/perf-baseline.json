@@ -1,0 +1,28 @@
+{
+  "captured_at_utc": "2026-03-07T20:06:18Z",
+  "benchmark_command": "go run ./cmd/kv-bench -server-bin ./kv-server -etcd-compare -etcd-duration-sec 15 -etcd-check-perf-sec 8 -etcd-write-workers 64 -etcd-read-workers 96 -etcd-read-keyspace 5000 -etcd-payload-bytes 256 -etcd-light-ops 200 -dataset-keys 12000 -dataset-rounds 2 -dataset-payload-bytes 512 -restart-trials 3 -keep-artifacts -workdir benchmark-artifacts/refactor-core/m0-baseline-r2",
+  "source_report": "benchmark-artifacts/refactor-core/m0-baseline.json",
+  "gates": {
+    "throughput_ratio_min": 0.9,
+    "latency_ratio_max": 1.15,
+    "wal_p99_ms_max": 10,
+    "backend_commit_p99_ms_max": 25
+  },
+  "metrics": {
+    "raft_write_p99_ms": 0.781,
+    "write_leader_throughput_rps": 2651.2745225241365,
+    "write_all_members_throughput_rps": 677.4616909154225,
+    "read_linearizable_throughput_rps": 39865.05895515933,
+    "read_serializable_throughput_rps": 55471.26089009992,
+    "write_leader_mean_latency_ms": 21.141674607560198,
+    "write_all_members_mean_latency_ms": 83.49872037315201,
+    "read_linearizable_mean_latency_ms": 2.4069942128777555,
+    "read_serializable_mean_latency_ms": 1.7293655082866666,
+    "light_put_mean_latency_ms": 1.458015,
+    "light_get_mean_latency_ms": 0.548505,
+    "wal_fsync_p99_ms": 5.513,
+    "backend_commit_p99_ms": 7.034,
+    "restart_merged_hints_ms": 28.382,
+    "disk_reduction_percent": 49.825680198362015
+  }
+}
