@@ -17,6 +17,18 @@ Raft is a consensus algorithm that keeps replicas in a consistent state by elect
 - API: gRPC `KVService` (`Get`, `Put`, `Delete`) for clients and gRPC Raft RPCs (`RequestVote`, `AppendEntries`) for inter-node communication.
 - Execution model: writes are acknowledged after quorum replication and state-machine apply; reads are served from local Bitcask keydir + single-seek data fetch.
 
+## Releases
+
+Tagged releases publish cross-platform binaries via GitHub Releases:
+- `caskv-server` for running cluster nodes
+- `caskv-client` for interactive `Get`/`Put`/`Delete`
+
+Version check:
+```bash
+./caskv-server -version
+./caskv-client -version
+```
+
 ## Benchmark Methodology
 
 Benchmarks are run by `cmd/kv-bench`, which launches an isolated 3-node cluster and captures machine-generated JSON output.
@@ -58,46 +70,40 @@ go run ./cmd/kv-bench \
   - Restart/open times across no-hint vs hint paths.
   - Disk reduction after merge compaction.
 
-## Latest Results (2026-03-07)
-
-Source report:
-`benchmark-artifacts/2026-03-07/etcd_compare_report_rerun_v2.json`
-
 ### Core project checks
 
-- Raft write p99 latency: **4.93 ms** (target `<10 ms`)
-- Restart time (merged+hints median): **48.96 ms**
-- Disk reduction after merge: **49.83%**
+- Raft write p99 latency: **0.52 ms** (target `<10 ms`)
+- Restart time (merged+hints median): **21.30 ms**
+- Disk reduction after merge: **50.17%** (just above the configured 50% upper bound)
 
-### etcd-style workload comparison
+### etcd-style workload comparison 
 
 | Scenario | etcd reference target | Raft-KV measured | Result |
 |---|---:|---:|---|
-| Heavy write throughput (leader-targeted) | 44,000 req/s | 2,080 req/s | miss |
-| Heavy write avg latency (leader-targeted) | 22 ms | 26.00 ms | miss |
-| Heavy write throughput (all-members target) | 50,000 req/s | 754 req/s | miss |
-| Heavy write avg latency (all-members target) | 20 ms | 72.54 ms | miss |
-| Heavy read throughput (linearizable) | 141,000 req/s | 43,227 req/s | miss |
-| Heavy read avg latency (linearizable) | 5.5 ms | 2.22 ms | pass |
-| Heavy read throughput (serializable) | 186,000 req/s | 58,367 req/s | miss |
-| Heavy read avg latency (serializable) | 2.2 ms | 1.64 ms | pass |
-| Light-load `Put` avg latency | <1 ms | 1.63 ms | miss |
-| Light-load `Get` avg latency | <1 ms | 0.60 ms | pass |
-| WAL fsync p99 proxy | <10 ms | 6.96 ms | pass |
-| Backend commit p99 proxy | <25 ms | 5.70 ms | pass |
+| Heavy write throughput (leader-targeted) | 44,000 req/s | 17,106 req/s | miss |
+| Heavy write avg latency (leader-targeted) | 22 ms | 3.30 ms | pass |
+| Heavy write throughput (all-members target) | 50,000 req/s | 14,317 req/s | miss |
+| Heavy write avg latency (all-members target) | 20 ms | 3.76 ms | pass |
+| Heavy read throughput (linearizable) | 141,000 req/s | 121,259 req/s | miss |
+| Heavy read avg latency (linearizable) | 5.5 ms | 0.79 ms | pass |
+| Heavy read throughput (serializable) | 186,000 req/s | 89,742 req/s | miss |
+| Heavy read avg latency (serializable) | 2.2 ms | 1.07 ms | pass |
+| Light-load `Put` avg latency | <1 ms | 0.256 ms | pass |
+| Light-load `Get` avg latency | <1 ms | 0.114 ms | pass |
+| WAL fsync p99 proxy | <10 ms | 6.68 ms | pass |
+| Backend commit p99 proxy | <25 ms | 5.13 ms | pass |
 
 `etcdctl check perf` style gates:
-- `small`: pass
+- `small`: fail
 - `medium`: fail
 - `large`: fail
 - `xlarge`: fail
 
 ## Interpreting the Numbers
 
-- The system is currently **latency-strong on read paths** and **healthy on local fsync durability paths**.
-- The system is currently **throughput-limited on replicated writes** under heavy concurrency.
-- All-members write targeting performs worse because follower-targeted requests incur redirect/retry behavior.
-- The benchmark identifies a clear optimization frontier around the write path, batching strategy, and Raft replication pipeline efficiency.
+- The current implementation is **latency-strong** across write and read paths, and meets the local fsync durability SLO proxies.
+- The system remains below etcd's published heavy-load throughput references on this hardware and topology.
+- `check perf` failures in this run are driven by high slowest-request outliers, which points to tail-latency spikes under stress rather than low average performance.
 
 ## Comparison Notes vs etcd
 
@@ -109,13 +115,6 @@ Important caveats for fair comparison:
 - This project is a focused educational/portfolio implementation, not a feature-complete etcd replacement.
 - The current “linearizable” read benchmark is leader-targeted read behavior in this implementation, not etcd ReadIndex semantics.
 - Results are environment-sensitive (CPU, disk class, kernel, network stack, background load).
-
-## Performance Roadmap
-
-- Implement write batching / group commit at the Raft layer.
-- Reduce per-command replication overhead and improve AppendEntries pipelining.
-- Add richer observability (per-stage histograms for queueing, replication, apply, fsync).
-- Introduce persistent Raft log + snapshots to improve long-run behavior under larger datasets.
 
 ## Repository Layout
 

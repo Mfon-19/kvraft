@@ -1,5 +1,6 @@
 # OS artifacts
 .DS_Store
+.idea/
 
 # Legacy local test data
 cmd/testdb/
@@ -11,6 +12,7 @@ cmd/testdb/
 /kv-test
 /kv-bench
 /raft-kv
+/dist/
 
 # Runtime and integration-test artifacts
 /node*.log

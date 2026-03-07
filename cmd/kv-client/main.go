@@ -16,9 +16,21 @@ import (
 	pb "kvraft/proto"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	address := flag.String("address", "localhost:8000", "Server address")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("caskv-client %s (commit=%s date=%s)\n", version, commit, date)
+		return
+	}
 
 	conn, err := grpc.Dial(*address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {

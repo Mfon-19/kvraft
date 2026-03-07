@@ -13,6 +13,12 @@ import (
 	"kvraft/server"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	id := flag.Int("id", 0, "Node Id")
 	port := flag.Int("port", 6000, "Raft RPC port")
@@ -20,7 +26,13 @@ func main() {
 	peersFlag := flag.String("peers", "", "Comma-separated list of peer addresses (e.g., localhost:5001,localhost:5002)")
 	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "Log format: text|json")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("caskv-server %s (commit=%s date=%s)\n", version, commit, date)
+		return
+	}
 
 	if err := common.ConfigureLogger(*logLevel, *logFormat, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "logger configuration error: %v\n", err)

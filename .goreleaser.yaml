@@ -1,0 +1,47 @@
+version: 2
+
+project_name: caskv
+
+builds:
+  - id: caskv-server
+    main: ./cmd/kv-server
+    binary: caskv-server
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  - id: caskv-client
+    main: ./cmd/kv-client
+    binary: caskv-client
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: caskv
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    ids:
+      - caskv-server
+      - caskv-client
+    formats:
+      - tar.gz
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: git
