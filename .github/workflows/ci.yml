@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit Tests
+        run: go test ./... -count=1
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Race Tests
+        run: go test -race ./... -count=1
+
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build Server Binary
+        run: go build -o kv-server ./cmd/kv-server
+      - name: Benchmark Smoke + No Regression
+        run: |
+          go run ./cmd/kv-bench \
+            -server-bin ./kv-server \
+            -etcd-compare \
+            -etcd-duration-sec 3 \
+            -etcd-check-perf-sec 2 \
+            -etcd-write-workers 8 \
+            -etcd-read-workers 12 \
+            -etcd-read-keyspace 500 \
+            -etcd-payload-bytes 128 \
+            -etcd-light-ops 50 \
+            -etcd-disk-fsync-samples 50 \
+            -etcd-disk-commit-samples 30 \
+            -etcd-disk-commit-batch 16 \
+            -writes 120 \
+            -consistency-sample 20 \
+            -dataset-keys 1000 \
+            -dataset-rounds 1 \
+            -dataset-payload-bytes 256 \
+            -restart-trials 1 \
+            -disk-reduction-min 0 \
+            -disk-reduction-max 100 \
+            -baseline docs/perf-baseline-smoke.json \
+            -strict

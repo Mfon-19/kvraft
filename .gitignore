@@ -18,9 +18,14 @@ cmd/testdb/
 # Runtime and integration-test artifacts
 /node*.log
 /kvstore_[0-9]*/
+/benchmark-artifacts/
 
 # Local benchmark and scratch artifacts
-/benchmark-artifacts/
 /newdir/
 /main.py
 /sample.txt
+
+# Go test/coverage artifacts
+*.test
+*.prof
+*.out
