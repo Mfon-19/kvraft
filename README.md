@@ -1,384 +1,136 @@
-# Raft-KV: Distributed Key-Value Database
+# Raft-KV
 
-A fault-tolerant, distributed key-value database built from scratch using the Raft consensus algorithm and Bitcask-style storage in Go.
+A distributed key-value store written in Go that combines a Raft replication layer with a Bitcask-style storage engine. The system exposes a gRPC API for `Get`, `Put`, and `Delete`, replicates writes across a 3-node quorum for strong write consistency, and uses an append-only on-disk format with an in-memory keydir for low-latency reads.
 
-## What is This Project?
+## Bitcask Primer
 
-Raft-KV is a distributed database that replicates data across multiple nodes to provide fault tolerance and high availability. Unlike a single-node database that fails when the server crashes, Raft-KV continues serving requests as long as a majority of nodes are alive.
+Bitcask is a log-structured key-value storage design where writes are append-only and reads are served through an in-memory index (`keydir`) that maps each key to its latest on-disk location. In practice, each write appends a record to a `.data` segment and updates the in-memory pointer, while each read does an O(1) keydir lookup followed by a single seek/read from disk with CRC validation. Old versions and tombstoned keys are cleaned up by merge compaction, and optional `.hint` files accelerate startup by rebuilding keydir without scanning full data files. It is important here because it gives predictable write I/O patterns and low read latency, which makes storage behavior easier to reason about under Raft replication load.
 
-**Key Features:**
-- **Fault Tolerant**: Survives minority node failures (2 out of 3 nodes can fail in a 5-node cluster)
-- **Strongly Consistent**: All reads see the latest committed writes (linearizability)
-- **Automatic Failover**: Elects a new leader within 300ms if the current leader crashes
-- **High Performance**: 5,000+ writes per second with O(1) read lookups
-- **Simple API**: Standard key-value operations (Get, Put, Delete)
+## Raft Primer
 
-## Why Do We Need Raft?
-
-### The Problem: Replication is Hard
-
-Imagine you have 3 database servers and want to keep them in sync:
-
-```
-Server 1: x=100
-Server 2: x=100
-Server 3: x=100
-```
-
-A client wants to update x to 200. What could go wrong?
-
-**Problem 1: Split Brain**
-```
-Client A writes x=200 to Server 1, Server 2
-Client B writes x=300 to Server 2, Server 3
-
-Result:
-Server 1: x=200
-Server 2: x=300  (which write won?)
-Server 3: x=300
-```
-
-**Problem 2: Partial Failures**
-```
-Client writes x=200
-Server 1: Success
-Server 2: Success
-Server 3: Network timeout
-
-Is the write committed? Can we tell the client "success"?
-What if Server 1 and 2 crash before Server 3 comes back?
-```
-
-**Problem 3: Leader Election**
-```
-All servers think they're the leader
-Multiple servers accept conflicting writes
-Database state diverges across nodes
-```
-
-### The Solution: Raft Consensus Algorithm
-
-Raft solves these problems by enforcing three key properties:
-
-**1. Single Leader**
-- Only one server accepts writes at a time
-- Followers redirect clients to the leader
-- Eliminates split-brain scenarios
-
-**2. Majority Quorum**
-- A write succeeds only when copied to a majority of nodes
-- Example: In a 5-node cluster, need 3 nodes to agree
-- Guarantees any two quorums overlap (preventing data loss)
-
-**3. Log-Based Ordering**
-- All operations are ordered in a replicated log
-- Servers apply operations in the same order
-- Results in identical state across all nodes
-
-## How Raft Works
-
-### Leader Election
-
-When the cluster starts or the leader crashes, nodes elect a new leader:
-
-```
-1. Followers wait for heartbeats from leader
-2. If no heartbeat after 150-300ms, become candidate
-3. Candidate increments term and requests votes
-4. If receives majority votes, becomes leader
-5. Leader sends periodic heartbeats to maintain authority
-```
-
-**Example Timeline:**
-```
-T=0ms:    All nodes start as followers
-T=200ms:  Node 1's timer fires, becomes candidate
-T=210ms:  Node 1 sends RequestVote to Node 0, Node 2
-T=215ms:  Node 0 votes yes, Node 2 votes yes
-T=220ms:  Node 1 becomes leader (2/3 votes)
-T=270ms:  Node 1 sends first heartbeat
-```
-
-### Log Replication
-
-When a client writes to the leader:
-
-```
-1. Leader appends command to its log (uncommitted)
-2. Leader sends AppendEntries RPC to all followers
-3. Followers append to their logs and acknowledge
-4. Once majority acknowledges, leader commits the entry
-5. Leader applies entry to state machine (Bitcask)
-6. Leader responds success to client
-7. Next heartbeat informs followers to commit
-```
-
-**Example:**
-```
-Client: PUT x=100
-
-Leader Log:    [... | {term:3, index:42, cmd:PUT x=100}] (uncommitted)
-                            |
-                            | AppendEntries RPC
-                            v
-Follower 1:    [... | {term:3, index:42, cmd:PUT x=100}] --> ACK
-Follower 2:    [... | {term:3, index:42, cmd:PUT x=100}] --> ACK
-
-Leader sees 2 ACKs (majority of 3)
-    --> Commit entry
-    --> Apply to Bitcask: bitcask.Put("x", "100")
-    --> Return success to client
-```
-
-### Safety Guarantees
-
-**Election Safety**: At most one leader per term
-- Servers vote for at most one candidate per term
-- Candidate needs majority votes to win
-- Two candidates cannot both get majority
-
-**Leader Completeness**: Leaders have all committed entries
-- Candidate's log must be at least as up-to-date as voter's
-- "Up-to-date" means: later term, or same term with more entries
-- Ensures committed entries never lost
-
-**State Machine Safety**: Servers apply same commands in same order
-- All servers apply log entries in index order
-- Once applied at index N, no server applies different command at N
-- Results in identical state machines
+Raft is a consensus algorithm that keeps replicas in a consistent state by electing a single leader and requiring quorum agreement for committed writes. Clients submit writes to the leader, the leader appends operations to its replicated log and sends them out to followers, followers acknowledge replication, and entries are considered committed only after a majority confirms them; committed entries are then applied to the state machine in log order on every node. This matters because it provides strong consistency and fault tolerance for distributed writes: as long as a majority of nodes is available, the cluster can continue safely, avoid split-brain write acceptance, and recover leadership automatically after node failures.
 
 ## Architecture
 
-### System Overview
+- Consensus: Raft leader election and log replication over gRPC.
+- Storage: Bitcask v2 engine with append-only `.data` segments, `.hint` files, CRC validation, tombstones, merge compaction, and single-writer locking.
+- API: gRPC `KVService` (`Get`, `Put`, `Delete`) for clients and gRPC Raft RPCs (`RequestVote`, `AppendEntries`) for inter-node communication.
+- Execution model: writes are acknowledged after quorum replication and state-machine apply; reads are served from local Bitcask keydir + single-seek data fetch.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Raft-KV Cluster                       │
-│                                                          │
-│   ┌──────────┐      ┌──────────┐      ┌──────────┐       │
-│   │  Node 0  │      │  Node 1  │      │  Node 2  │       │
-│   │ (Leader) │<---->│(Follower)│<---->│(Follower)│       │
-│   └──────────┘      └──────────┘      └──────────┘       │
-│        ^                                                 │
-│        |                                                 │
-└────────|─────────────────────────────────────────────────┘
-         |
-         | Client Requests
-         v
-    ┌─────────┐
-    │  Client │
-    └─────────┘
-```
+## Benchmark Methodology
 
-### Single Node Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                       Node                           │
-│                                                      │
-│  Client Interface (gRPC)                             │
-│         |                                            │
-│         v                                            │
-│  ┌──────────────────┐                                │
-│  │  Raft Layer      │  Leader Election               │
-│  │                  │  Log Replication               │
-│  │  - currentTerm   │  Safety Rules                  │
-│  │  - votedFor      │                                │
-│  │  - log[]         │                                │
-│  └────────┬─────────┘                                │
-│           |                                          │
-│           | Apply committed entries                  │
-│           v                                          │
-│  ┌──────────────────┐                                │
-│  │  State Machine   │  Bitcask Storage:              │
-│  │  (Bitcask)       │  - Append-only writes          │
-│  │                  │  - In-memory keydir            │
-│  │  data: {k->v}    │  - O(1) lookups                │
-│  └──────────────────┘                                │
-└──────────────────────────────────────────────────────┘
-```
-
-### Write Flow
-
-```
-1. Client sends PUT request to any node
-2. If not leader, node redirects to leader
-3. Leader appends entry to Raft log
-4. Leader replicates to followers via gRPC
-5. Followers acknowledge receipt
-6. Leader waits for majority acknowledgment
-7. Leader commits entry (updates commitIndex)
-8. Leader applies entry to Bitcask storage
-9. Leader responds success to client
-10. Next heartbeat tells followers to commit
-11. Followers apply to their Bitcask storage
-```
-
-### Why Separate Raft Log from Bitcask Storage?
-
-**Raft Log**: Source of truth for consensus
-- Determines what operations were agreed upon
-- Determines the order of operations
-- Used for replication and recovery
-
-**Bitcask Storage**: Derived state (the "state machine")
-- Result of applying committed log entries
-- Can be rebuilt by replaying the Raft log
-- Optimized for fast key-value operations
-
-**Benefits of Separation:**
-- Clean separation of concerns (consensus vs storage)
-- Can snapshot Bitcask state and discard old log entries
-- Can swap storage engines without changing consensus
-- Recovery: rebuild state by replaying log
-
-## Bitcask Storage Engine
-
-Bitcask is a log-structured storage engine designed for fast key-value operations:
-
-**Write Path:**
-```
-1. Append entry to active data file
-   Format: [crc | timestamp | key_size | value_size | key | value]
-2. Update in-memory keydir
-   keydir[key] = {file_id, offset, size, timestamp}
-```
-
-**Read Path:**
-```
-1. Lookup key in keydir: O(1) hash lookup
-2. Read from file at offset: Single disk seek
-3. Verify CRC and return value
-```
-
-**Why Bitcask for Raft?**
-- **Append-only writes**: Matches Raft's append-only log semantics
-- **Fast writes**: Sequential I/O, no random seeks
-- **Fast reads**: O(1) lookup via in-memory index
-- **Simple recovery**: Rebuild keydir by scanning data files
-- **Crash-friendly**: No corruption from partial writes
-
-## Technology Stack
-
-- **Language**: Go 1.21
-- **RPC Framework**: gRPC with Protocol Buffers
-- **Storage**: Bitcask-style log-structured storage
-- **Consensus**: Raft algorithm (based on the original paper)
-- **Serialization**: Protocol Buffers
-- **Networking**: TCP with gRPC
-
-## Performance Characteristics
-
-- **Write Throughput**: 5,000+ writes/second
-- **Read Latency**: O(1) hash lookup, typically <1ms
-- **Write Latency**: <100ms under normal operation (includes replication)
-- **Leader Election**: <300ms failover time
-- **Fault Tolerance**: Survives minority failures (up to N/2 - 1 nodes)
-
-## Benchmarking Claims
-
-To validate claims like:
-- p99 write latency `<10ms` on a 3-node Raft cluster
-- restart recovery and disk usage improvements from hint indexing + merge compaction
-
-use the benchmark runner:
+Benchmarks are run by `cmd/kv-bench`, which launches an isolated 3-node cluster and captures machine-generated JSON output.
 
 ```bash
 go build -o kv-server ./cmd/kv-server
-go run ./cmd/kv-bench -server-bin ./kv-server -strict
+go run ./cmd/kv-bench \
+  -server-bin ./kv-server \
+  -etcd-compare \
+  -etcd-duration-sec 15 \
+  -etcd-check-perf-sec 8 \
+  -etcd-write-workers 64 \
+  -etcd-read-workers 96 \
+  -etcd-read-keyspace 5000 \
+  -etcd-payload-bytes 256 \
+  -etcd-light-ops 200 \
+  -dataset-keys 12000 \
+  -dataset-rounds 2 \
+  -dataset-payload-bytes 512 \
+  -restart-trials 3 \
+  -keep-artifacts \
+  -workdir benchmark-artifacts/$(date +%F)/etcd-compare
 ```
 
-`kv-bench` will:
-- start an isolated 3-node cluster in a temporary working directory
-- measure write latency percentiles and replication convergence
-- build a synthetic Bitcask dataset, then compare restart/open time and disk usage across:
-  - no hints (baseline)
-  - hints only
-  - hints + merge compaction
-- print a JSON report and target pass/fail summary
+### What each benchmark measures
 
-Useful flags:
-- `-writes` number of latency writes
-- `-p99-target-ms` p99 threshold
-- `-dataset-keys`, `-dataset-rounds`, `-dataset-payload-bytes` storage benchmark scale
-- `-disk-reduction-min`, `-disk-reduction-max` expected compaction range
-- `-keep-artifacts` to retain node logs and benchmark data
+- Raft write latency benchmark:
+  - Sequential leader-targeted writes.
+  - Reports p50/p95/p99 and checks replication convergence.
+- Heavy-load throughput benchmark:
+  - Concurrent write/read workers for sustained load.
+  - Reports throughput, mean latency, tails, and slowest request.
+- Light-load latency benchmark:
+  - Sequential low-contention `Put`/`Get` latency.
+- Disk latency SLO proxy benchmark:
+  - `SyncOnPut` latencies as a WAL fsync proxy.
+  - Explicit `Sync()` latencies as a backend commit proxy.
+- Storage recovery/compaction benchmark:
+  - Restart/open times across no-hint vs hint paths.
+  - Disk reduction after merge compaction.
 
-## Use Cases
+## Latest Results (2026-03-07)
 
-**When to Use Raft-KV:**
-- Need strong consistency guarantees
-- Can tolerate 100-200ms write latency
-- Require automatic failover
-- Have predictable read/write patterns
-- Need simple key-value semantics
+Source report:
+`benchmark-artifacts/2026-03-07/etcd_compare_report_rerun_v2.json`
 
-**When NOT to Use Raft-KV:**
-- Need millisecond write latency
-- Require cross-datacenter replication (use multi-Raft)
-- Need complex queries (use a real database)
-- Have massive datasets (add sharding)
+### Core project checks
 
-## Limitations
+- Raft write p99 latency: **4.93 ms** (target `<10 ms`)
+- Restart time (merged+hints median): **48.96 ms**
+- Disk reduction after merge: **49.83%**
 
-This is an educational implementation demonstrating core concepts:
+### etcd-style workload comparison
 
-**Current Limitations:**
-- No persistence (data lost on full cluster restart)
-- No log compaction (log grows unbounded)
-- No snapshots (slow recovery on restart)
-- No membership changes (cluster size fixed at startup)
-- No multi-datacenter support
-- Simplified error handling
+| Scenario | etcd reference target | Raft-KV measured | Result |
+|---|---:|---:|---|
+| Heavy write throughput (leader-targeted) | 44,000 req/s | 2,080 req/s | miss |
+| Heavy write avg latency (leader-targeted) | 22 ms | 26.00 ms | miss |
+| Heavy write throughput (all-members target) | 50,000 req/s | 754 req/s | miss |
+| Heavy write avg latency (all-members target) | 20 ms | 72.54 ms | miss |
+| Heavy read throughput (linearizable) | 141,000 req/s | 43,227 req/s | miss |
+| Heavy read avg latency (linearizable) | 5.5 ms | 2.22 ms | pass |
+| Heavy read throughput (serializable) | 186,000 req/s | 58,367 req/s | miss |
+| Heavy read avg latency (serializable) | 2.2 ms | 1.64 ms | pass |
+| Light-load `Put` avg latency | <1 ms | 1.63 ms | miss |
+| Light-load `Get` avg latency | <1 ms | 0.60 ms | pass |
+| WAL fsync p99 proxy | <10 ms | 6.96 ms | pass |
+| Backend commit p99 proxy | <25 ms | 5.70 ms | pass |
 
-**Production Requirements:**
-- Persistent storage for Raft log
-- Snapshot and log compaction
-- Dynamic cluster membership
-- Better observability (metrics, tracing)
-- Comprehensive testing (chaos engineering)
-- Security (TLS, authentication)
+`etcdctl check perf` style gates:
+- `small`: pass
+- `medium`: fail
+- `large`: fail
+- `xlarge`: fail
 
-## Project Structure
+## Interpreting the Numbers
 
+- The system is currently **latency-strong on read paths** and **healthy on local fsync durability paths**.
+- The system is currently **throughput-limited on replicated writes** under heavy concurrency.
+- All-members write targeting performs worse because follower-targeted requests incur redirect/retry behavior.
+- The benchmark identifies a clear optimization frontier around the write path, batching strategy, and Raft replication pipeline efficiency.
+
+## Comparison Notes vs etcd
+
+The etcd targets come from published etcd operational/performance references:
+- [etcd performance guide](https://etcd.io/docs/v3.6/op-guide/performance/)
+- [etcd FAQ performance guidance](https://etcd.io/docs/v3.7/faq/)
+
+Important caveats for fair comparison:
+- This project is a focused educational/portfolio implementation, not a feature-complete etcd replacement.
+- The current “linearizable” read benchmark is leader-targeted read behavior in this implementation, not etcd ReadIndex semantics.
+- Results are environment-sensitive (CPU, disk class, kernel, network stack, background load).
+
+## Performance Roadmap
+
+- Implement write batching / group commit at the Raft layer.
+- Reduce per-command replication overhead and improve AppendEntries pipelining.
+- Add richer observability (per-stage histograms for queueing, replication, apply, fsync).
+- Introduce persistent Raft log + snapshots to improve long-run behavior under larger datasets.
+
+## Repository Layout
+
+```text
+cmd/
+  kv-server/   # server binary
+  kv-client/   # interactive client
+  kv-test/     # integration smoke runner
+  kv-bench/    # automated benchmark runner
+kvstore/
+  store.go     # Bitcask v2 storage engine
+raft/
+  node.go      # Raft core
+server/
+  server.go    # Raft + KV service integration
+proto/
+  raft.proto   # gRPC contracts
 ```
-raft-kv/
-├── cmd/
-│   ├── kv-server/          # Server binary entrypoint
-│   ├── kv-client/          # CLI client entrypoint
-│   ├── kv-test/            # End-to-end integration smoke runner
-│   └── kv-bench/           # Automated latency/recovery/disk benchmark runner
-├── proto/
-│   └── raft.proto          # gRPC service definitions
-├── raft/
-│   ├── node.go             # Core Raft implementation
-│   └── rpc.go              # RPC message types
-├── kvstore/
-│   └── store.go            # Bitcask storage engine
-├── server/
-│   └── server.go           # gRPC server + glue logic
-└── run_cluster.sh          # Helper script for local manual cluster runs
-```
-
-## Further Reading
-
-**Raft Resources:**
-- [In Search of an Understandable Consensus Algorithm (Extended Version)](https://raft.github.io/raft.pdf) - The original Raft paper
-- [The Raft Consensus Algorithm](https://raft.github.io/) - Official website
-
-**Bitcask Resources:**
-- [Bitcask: A Log-Structured Hash Table for Fast Key/Value Data](https://riak.com/assets/bitcask-intro.pdf)
-
-**Distributed Systems Concepts:**
-- [Designing Data-Intensive Applications](https://dataintensive.net/) by Martin Kleppmann
-- [Distributed Systems](https://www.distributed-systems.net/index.php/books/ds3/) by Maarten van Steen
-
-## License
-
-MIT
-
-## Acknowledgments
-
-- Diego Ongaro and John Ousterhout for the Raft algorithm
-- Basho Technologies for the Bitcask design
-- The Go team for excellent concurrency primitives
