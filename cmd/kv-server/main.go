@@ -3,27 +3,35 @@ package main
 import (
 	"flag"
 	"fmt"
-	"kvraft/server"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+
+	"kvraft/common"
+	"kvraft/server"
 )
 
 func main() {
-	// command line flags
 	id := flag.Int("id", 0, "Node Id")
 	port := flag.Int("port", 6000, "Raft RPC port")
 	clientPort := flag.Int("client-port", 8000, "Client request port")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peer addresses (e.g., localhost:5001,localhost:5002)")
+	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
+	logFormat := flag.String("log-format", "text", "Log format: text|json")
 	flag.Parse()
 
-	if *id < 0 {
-		log.Fatal("Node Id must be >= 0")
+	if err := common.ConfigureLogger(*logLevel, *logFormat, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "logger configuration error: %v\n", err)
+		os.Exit(1)
 	}
 
-	// parse peers
+	if *id < 0 {
+		slog.Error("invalid node id", "id", *id)
+		os.Exit(1)
+	}
+
 	var peers []string
 	if *peersFlag != "" {
 		peers = strings.Split(*peersFlag, ",")
@@ -32,30 +40,33 @@ func main() {
 	address := fmt.Sprintf("localhost:%d", *port)
 	clientAddress := fmt.Sprintf("localhost:%d", *clientPort)
 
-	log.Printf("Starting Raft-KV node %d", *id)
-	log.Printf("Raft RPC address: %s", address)
-	log.Printf("Client address: %s", clientAddress)
-	log.Printf("Peers: %v", peers)
+	slog.Info("starting raft-kv node", "id", *id, "raft_address", address, "client_address", clientAddress, "peers", peers)
 
-	srv := server.NewRaftKVServer(*id, address, peers)
-
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Failed to start Raft server: %v", err)
-	}
-
-	if err := srv.StartClientListener(clientAddress); err != nil {
-		log.Printf("Failed to start client listener: %v", err)
-		log.Printf("Cleaning up and shutting down...")
-		srv.Close()
+	srv, err := server.NewRaftKVServer(server.Config{
+		ID:          *id,
+		RaftAddress: address,
+		Peers:       peers,
+	})
+	if err != nil {
+		slog.Error("failed to construct raft server", "error", err)
 		os.Exit(1)
 	}
 
-	log.Printf("Node %d is running", *id)
+	if err := srv.Start(); err != nil {
+		slog.Error("failed to start raft rpc server", "error", err)
+		os.Exit(1)
+	}
+
+	if err := srv.StartClientListener(clientAddress); err != nil {
+		slog.Error("failed to start client listener", "error", err)
+		srv.Close()
+		os.Exit(1)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Printf("Shutting down node %d", *id)
+	slog.Info("shutting down raft-kv node", "id", *id)
 	srv.Close()
 }

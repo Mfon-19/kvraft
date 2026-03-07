@@ -2,61 +2,121 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"kvraft/kvstore"
 	pb "kvraft/proto"
 	"kvraft/raft"
-	"log"
-	"net"
-	"sync"
-	"time"
 )
 
-type RaftKVServer struct {
-	mu sync.RWMutex
+var (
+	ErrNotLeader     = errors.New("not leader")
+	ErrCommitTimeout = errors.New("command timed out waiting for commit")
+	ErrServerClosed  = errors.New("server closed")
+)
 
-	id          int
-	address     string
-	raftNode    *raft.Node
-	store       *kvstore.DB
-	grpcServer  *grpc.Server
-	clientGRPC  *grpc.Server
-	listener    net.Listener
-	clientLn    net.Listener
-	pending     map[int]chan string
-	pendingLock sync.Mutex
+type Config struct {
+	ID          int
+	RaftAddress string
+	Peers       []string
+
+	StoreDir     string
+	StoreOptions kvstore.OpenOptions
+
+	ApplyBuffer   int
+	CommitTimeout time.Duration
 }
 
-func NewRaftKVServer(id int, address string, peers []string) *RaftKVServer {
-	s := &RaftKVServer{
-		id:      id,
-		address: address,
-		pending: make(map[int]chan string),
-	}
+type pendingKey struct {
+	index int
+	term  int
+}
 
-	dir := fmt.Sprintf("kvstore_%d", id)
-	open, err := kvstore.OpenWithOptions(dir, kvstore.OpenOptions{
-		ReadWrite:            true,
-		SyncOnPut:            false,
-		MaxDataFileSizeBytes: 64 * 1024 * 1024,
-	})
+type RaftKVServer struct {
+	id      int
+	address string
+
+	raftNode *raft.Node
+	store    *kvstore.DB
+
+	grpcServer *grpc.Server
+	clientGRPC *grpc.Server
+	listener   net.Listener
+	clientLn   net.Listener
+
+	pendingLock sync.Mutex
+	pending     map[pendingKey]chan error
+
+	commitTimeout time.Duration
+	closedCh      chan struct{}
+	closeOnce     sync.Once
+	applyWg       sync.WaitGroup
+}
+
+func NewRaftKVServer(cfg Config) (*RaftKVServer, error) {
+	cfg, err := normalizeConfig(cfg)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	s.store = open
 
-	applyCh := make(chan raft.ApplyMsg, 100)
+	open, err := kvstore.OpenWithOptions(cfg.StoreDir, cfg.StoreOptions)
+	if err != nil {
+		return nil, fmt.Errorf("open kvstore: %w", err)
+	}
+
+	s := &RaftKVServer{
+		id:            cfg.ID,
+		address:       cfg.RaftAddress,
+		store:         open,
+		pending:       make(map[pendingKey]chan error),
+		commitTimeout: cfg.CommitTimeout,
+		closedCh:      make(chan struct{}),
+	}
+
+	applyCh := make(chan raft.ApplyMsg, cfg.ApplyBuffer)
 	rpcHandler := &GRPCClient{}
-	s.raftNode = raft.NewNode(id, peers, applyCh, rpcHandler)
+	s.raftNode = raft.NewNode(cfg.ID, cfg.Peers, applyCh, rpcHandler)
 
-	go s.applyCommittedEntries(applyCh)
-	return s
+	s.applyWg.Add(1)
+	go func() {
+		defer s.applyWg.Done()
+		s.applyCommittedEntries(applyCh)
+	}()
+
+	return s, nil
+}
+
+func normalizeConfig(cfg Config) (Config, error) {
+	if cfg.ID < 0 {
+		return cfg, fmt.Errorf("node id must be >= 0")
+	}
+	if cfg.RaftAddress == "" {
+		return cfg, fmt.Errorf("raft address must be set")
+	}
+	if cfg.StoreDir == "" {
+		cfg.StoreDir = fmt.Sprintf("kvstore_%d", cfg.ID)
+	}
+	if cfg.ApplyBuffer <= 0 {
+		cfg.ApplyBuffer = 256
+	}
+	if cfg.CommitTimeout <= 0 {
+		cfg.CommitTimeout = 5 * time.Second
+	}
+	if cfg.StoreOptions.MaxDataFileSizeBytes <= 0 {
+		cfg.StoreOptions.MaxDataFileSizeBytes = 64 * 1024 * 1024
+	}
+	cfg.StoreOptions.ReadWrite = true
+	return cfg, nil
 }
 
 func (s *RaftKVServer) Start() error {
-	// register rpc service
 	s.grpcServer = grpc.NewServer()
 	pb.RegisterRaftServiceServer(s.grpcServer, &GRPCRaftService{server: s})
 
@@ -66,116 +126,92 @@ func (s *RaftKVServer) Start() error {
 	}
 	s.listener = listener
 
-	log.Printf("[Server %d] Listening on %s", s.id, s.address)
-
+	slog.Info("raft rpc listener started", "server_id", s.id, "address", s.address)
 	go func() {
 		if err := s.grpcServer.Serve(listener); err != nil {
-			log.Printf("[Server %d] gRPC server error: %v", s.id, err)
+			slog.Error("raft rpc server stopped", "server_id", s.id, "error", err)
 		}
 	}()
 
 	return nil
 }
 
-func (s *RaftKVServer) applyCommittedEntries(applyCh chan raft.ApplyMsg) {
-	// loop over all commands waiting to be applied
-	for msg := range applyCh {
-		s.mu.Lock()
-
-		var applyErr error
-
-		// apply the message to our kv store
-		switch msg.Command.Type {
-		case "put":
-			applyErr = s.store.Put(msg.Command.Key, msg.Command.Value)
-			if applyErr == nil {
-				log.Printf("[Server %d] Applied PUT: %s = %s", s.id, msg.Command.Key, msg.Command.Value)
+func (s *RaftKVServer) applyCommittedEntries(applyCh <-chan raft.ApplyMsg) {
+	for {
+		select {
+		case <-s.closedCh:
+			return
+		case msg := <-applyCh:
+			var applyErr error
+			switch msg.Command.Type {
+			case "put":
+				applyErr = s.store.Put(msg.Command.Key, msg.Command.Value)
+			case "delete":
+				applyErr = s.store.Delete(msg.Command.Key)
 			}
-		case "delete":
-			applyErr = s.store.Delete(msg.Command.Key)
-			if applyErr == nil {
-				log.Printf("[Server %d] Applied DELETE: %s", s.id, msg.Command.Key)
+
+			key := pendingKey{index: msg.Index, term: msg.Term}
+			s.pendingLock.Lock()
+			if ch, ok := s.pending[key]; ok {
+				ch <- applyErr
+				delete(s.pending, key)
 			}
+			s.pendingLock.Unlock()
 		}
-
-		if applyErr != nil {
-			log.Printf("[Server %d] Error applying %s: %v", s.id, msg.Command.Type, applyErr)
-		}
-
-		// notify the pending request regardless of apply status to avoid client hangs
-		s.pendingLock.Lock()
-		if ch, ok := s.pending[msg.Index]; ok {
-			ch <- msg.Command.Value
-			delete(s.pending, msg.Index)
-		}
-		s.pendingLock.Unlock()
-
-		s.mu.Unlock()
 	}
 }
 
-// API for the client
-
 func (s *RaftKVServer) Get(key string) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	return s.store.Get(key)
 }
 
 func (s *RaftKVServer) Put(key, value string) error {
-	cmd := raft.Command{
-		Type:  "put",
-		Key:   key,
-		Value: value,
-	}
-
-	index, _, isLeader := s.raftNode.Submit(cmd)
-	if !isLeader {
-		return fmt.Errorf("not leader")
-	}
-
-	ch := make(chan string, 1)
-	s.pendingLock.Lock()
-	s.pending[index] = ch
-	s.pendingLock.Unlock()
-
-	select {
-	case <-ch:
-		// command applied
-		return nil
-	case <-time.After(5 * time.Second):
-		s.pendingLock.Lock()
-		delete(s.pending, index)
-		s.pendingLock.Unlock()
-		return fmt.Errorf("put command timed out waiting for commit")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.commitTimeout)
+	defer cancel()
+	return s.submitAndWait(ctx, raft.Command{Type: "put", Key: key, Value: value})
 }
 
 func (s *RaftKVServer) Delete(key string) error {
-	cmd := raft.Command{
-		Type: "delete",
-		Key:  key,
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.commitTimeout)
+	defer cancel()
+	return s.submitAndWait(ctx, raft.Command{Type: "delete", Key: key})
+}
 
-	index, _, isLeader := s.raftNode.Submit(cmd)
+func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd raft.Command) error {
+	index, term, isLeader := s.raftNode.Submit(cmd)
 	if !isLeader {
-		return fmt.Errorf("not leader")
+		return ErrNotLeader
 	}
 
-	ch := make(chan string, 1)
+	waitKey := pendingKey{index: index, term: term}
+	waitCh := make(chan error, 1)
+
 	s.pendingLock.Lock()
-	s.pending[index] = ch
+	select {
+	case <-s.closedCh:
+		s.pendingLock.Unlock()
+		return ErrServerClosed
+	default:
+	}
+	s.pending[waitKey] = waitCh
 	s.pendingLock.Unlock()
 
 	select {
-	case <-ch:
-		return nil
-	case <-time.After(5 * time.Second):
+	case err := <-waitCh:
+		return err
+	case <-ctx.Done():
 		s.pendingLock.Lock()
-		delete(s.pending, index)
+		delete(s.pending, waitKey)
 		s.pendingLock.Unlock()
-		return fmt.Errorf("delete command timed out waiting for commit")
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ErrCommitTimeout
+		}
+		return ctx.Err()
+	case <-s.closedCh:
+		s.pendingLock.Lock()
+		delete(s.pending, waitKey)
+		s.pendingLock.Unlock()
+		return ErrServerClosed
 	}
 }
 
@@ -184,29 +220,43 @@ func (s *RaftKVServer) IsLeader() bool {
 }
 
 func (s *RaftKVServer) Close() {
-	s.raftNode.Shutdown()
-	if s.grpcServer != nil {
-		s.grpcServer.GracefulStop()
-	}
-	if s.clientGRPC != nil {
-		s.clientGRPC.GracefulStop()
-	}
-	if s.store != nil {
-		if err := s.store.Close(); err != nil {
-			log.Printf("[Server %d] Error closing kv store: %v", s.id, err)
+	s.closeOnce.Do(func() {
+		close(s.closedCh)
+
+		s.pendingLock.Lock()
+		for key, ch := range s.pending {
+			ch <- ErrServerClosed
+			delete(s.pending, key)
 		}
-	}
-	if s.listener != nil {
-		err := s.listener.Close()
-		if err != nil {
-			log.Printf("[Server %d] Error closing server", s.id)
+		s.pendingLock.Unlock()
+
+		if s.raftNode != nil {
+			s.raftNode.Shutdown()
 		}
-	}
-	if s.clientLn != nil {
-		if err := s.clientLn.Close(); err != nil {
-			log.Printf("[Server %d] Error closing client server", s.id)
+		if s.grpcServer != nil {
+			s.grpcServer.GracefulStop()
 		}
-	}
+		if s.clientGRPC != nil {
+			s.clientGRPC.GracefulStop()
+		}
+		if s.listener != nil {
+			if err := s.listener.Close(); err != nil {
+				slog.Error("failed to close raft listener", "server_id", s.id, "error", err)
+			}
+		}
+		if s.clientLn != nil {
+			if err := s.clientLn.Close(); err != nil {
+				slog.Error("failed to close client listener", "server_id", s.id, "error", err)
+			}
+		}
+		if s.store != nil {
+			if err := s.store.Close(); err != nil {
+				slog.Error("failed to close kvstore", "server_id", s.id, "error", err)
+			}
+		}
+
+		s.applyWg.Wait()
+	})
 }
 
 type GRPCRaftService struct {
@@ -256,7 +306,6 @@ func (g *GRPCKVService) Delete(ctx context.Context, req *pb.KVRequest) (*pb.KVRe
 }
 
 type GRPCClient struct {
-	peers []string
 	conns map[string]*grpc.ClientConn
 	mu    sync.Mutex
 }
@@ -268,16 +317,13 @@ func (c *GRPCClient) getConnection(target string) (*grpc.ClientConn, error) {
 	if c.conns == nil {
 		c.conns = make(map[string]*grpc.ClientConn)
 	}
-
-	// if already connected, return connection
 	if conn, ok := c.conns[target]; ok {
 		return conn, nil
 	}
 
-	// if not connected, connect asynchronously (no WithBlock to avoid timeout issues)
 	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Printf("[GRPCClient] Error dialing server %s: %v", target, err)
+		slog.Debug("grpc dial failed", "target", target, "error", err)
 		return nil, err
 	}
 
@@ -292,9 +338,7 @@ func (c *GRPCClient) RequestVote(ctx context.Context, target string, args *raft.
 	}
 
 	client := pb.NewRaftServiceClient(conn)
-
-	req := raft.RequestVoteArgsToProto(args)
-	resp, err := client.RequestVote(ctx, req)
+	resp, err := client.RequestVote(ctx, raft.RequestVoteArgsToProto(args))
 	if err != nil {
 		return err
 	}
@@ -310,9 +354,7 @@ func (c *GRPCClient) AppendEntries(ctx context.Context, target string, args *raf
 	}
 
 	client := pb.NewRaftServiceClient(conn)
-
-	req := raft.AppendEntriesArgsToProto(args)
-	resp, err := client.AppendEntries(ctx, req)
+	resp, err := client.AppendEntries(ctx, raft.AppendEntriesArgsToProto(args))
 	if err != nil {
 		return err
 	}
@@ -321,61 +363,19 @@ func (c *GRPCClient) AppendEntries(ctx context.Context, target string, args *raf
 	return nil
 }
 
-type ClientRequest struct {
-	Type  string // "get", "put", "delete"
-	Key   string
-	Value string
-}
-
-type ClientResponse struct {
-	Success bool
-	Value   string
-	Error   string
-}
-
-func (s *RaftKVServer) HandleClientRequest(req ClientRequest) ClientResponse {
-	switch req.Type {
-	case "get":
-		value, err := s.Get(req.Key)
-		if err != nil {
-			return ClientResponse{Success: false, Error: err.Error()}
-		}
-		return ClientResponse{Success: true, Value: string(value)}
-
-	case "put":
-		err := s.Put(req.Key, req.Value)
-		if err != nil {
-			return ClientResponse{Success: false, Error: err.Error()}
-		}
-		return ClientResponse{Success: true}
-
-	case "delete":
-		err := s.Delete(req.Key)
-		if err != nil {
-			return ClientResponse{Success: false, Error: err.Error()}
-		}
-		return ClientResponse{Success: true}
-
-	default:
-		return ClientResponse{Success: false, Error: "unknown command"}
-	}
-}
-
 func (s *RaftKVServer) StartClientListener(clientPort string) error {
 	listener, err := net.Listen("tcp", clientPort)
 	if err != nil {
-		log.Printf("[Server %d] Error listening on port %s", s.id, clientPort)
 		return err
 	}
 	s.clientLn = listener
 	s.clientGRPC = grpc.NewServer()
 	pb.RegisterKVServiceServer(s.clientGRPC, &GRPCKVService{server: s})
 
-	log.Printf("[Server %d] Client listener on %s", s.id, clientPort)
-
+	slog.Info("client listener started", "server_id", s.id, "address", clientPort)
 	go func() {
 		if err := s.clientGRPC.Serve(listener); err != nil {
-			log.Printf("[Server %d] Client gRPC server error: %v", s.id, err)
+			slog.Error("client grpc server stopped", "server_id", s.id, "error", err)
 		}
 	}()
 

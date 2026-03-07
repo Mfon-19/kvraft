@@ -45,6 +45,7 @@ type Command struct {
 
 type ApplyMsg struct {
 	Index   int
+	Term    int
 	Command Command
 }
 

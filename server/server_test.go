@@ -1,12 +1,14 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"kvraft/kvstore"
+	pb "kvraft/proto"
 	"kvraft/raft"
 )
 
@@ -26,85 +28,79 @@ func newTestStore(t *testing.T) *kvstore.DB {
 	return db
 }
 
-func TestHandleClientRequestUnknownCommand(t *testing.T) {
-	s := &RaftKVServer{
-		store:   newTestStore(t),
-		pending: make(map[int]chan string),
-	}
-
-	resp := s.HandleClientRequest(ClientRequest{Type: "unknown"})
-	if resp.Success {
-		t.Fatalf("expected unknown command to fail")
-	}
-	if resp.Error != "unknown command" {
-		t.Fatalf("unexpected error %q", resp.Error)
+func newBareServer(t *testing.T) *RaftKVServer {
+	t.Helper()
+	return &RaftKVServer{
+		store:         newTestStore(t),
+		pending:       make(map[pendingKey]chan error),
+		closedCh:      make(chan struct{}),
+		commitTimeout: 100 * time.Millisecond,
 	}
 }
 
-func TestHandleClientRequestGetPaths(t *testing.T) {
-	s := &RaftKVServer{
-		store:   newTestStore(t),
-		pending: make(map[int]chan string),
-	}
+func TestGRPCKVGetPaths(t *testing.T) {
+	s := newBareServer(t)
+	api := &GRPCKVService{server: s}
 
-	resp := s.HandleClientRequest(ClientRequest{Type: "get", Key: "missing"})
-	if resp.Success {
-		t.Fatalf("expected get missing to fail")
+	missing, err := api.Get(context.Background(), &pb.KVRequest{Key: "missing"})
+	if err != nil {
+		t.Fatalf("grpc get missing returned rpc err: %v", err)
 	}
-	if !strings.Contains(resp.Error, kvstore.ErrKeyNotFound.Error()) {
-		t.Fatalf("expected key-not-found error, got %q", resp.Error)
+	if missing.Success {
+		t.Fatalf("expected missing key get to fail")
+	}
+	if !strings.Contains(missing.Error, kvstore.ErrKeyNotFound.Error()) {
+		t.Fatalf("expected key-not-found error, got %q", missing.Error)
 	}
 
 	if err := s.store.Put("foo", "bar"); err != nil {
 		t.Fatalf("seed put: %v", err)
 	}
-	resp = s.HandleClientRequest(ClientRequest{Type: "get", Key: "foo"})
-	if !resp.Success {
-		t.Fatalf("expected get success, got error %q", resp.Error)
+	found, err := api.Get(context.Background(), &pb.KVRequest{Key: "foo"})
+	if err != nil {
+		t.Fatalf("grpc get existing returned rpc err: %v", err)
 	}
-	if resp.Value != "bar" {
-		t.Fatalf("expected value bar got %q", resp.Value)
+	if !found.Success || found.Value != "bar" {
+		t.Fatalf("expected success with bar, got %+v", found)
 	}
 }
 
 func TestPutDeleteReturnNotLeader(t *testing.T) {
-	s := &RaftKVServer{
-		raftNode: &raft.Node{},
-		store:    newTestStore(t),
-		pending:  make(map[int]chan string),
-	}
+	s := newBareServer(t)
+	s.raftNode = &raft.Node{}
 
-	if err := s.Put("k", "v"); err == nil || err.Error() != "not leader" {
-		t.Fatalf("expected not leader on put, got %v", err)
+	if err := s.Put("k", "v"); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("expected ErrNotLeader on put, got %v", err)
 	}
-	if err := s.Delete("k"); err == nil || err.Error() != "not leader" {
-		t.Fatalf("expected not leader on delete, got %v", err)
+	if err := s.Delete("k"); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("expected ErrNotLeader on delete, got %v", err)
 	}
 }
 
-func TestHandleClientRequestPutDeleteNotLeader(t *testing.T) {
-	s := &RaftKVServer{
-		raftNode: &raft.Node{},
-		store:    newTestStore(t),
-		pending:  make(map[int]chan string),
+func TestGRPCKVPutDeleteNotLeader(t *testing.T) {
+	s := newBareServer(t)
+	s.raftNode = &raft.Node{}
+	api := &GRPCKVService{server: s}
+
+	putResp, err := api.Put(context.Background(), &pb.KVRequest{Key: "k", Value: "v"})
+	if err != nil {
+		t.Fatalf("grpc put returned rpc err: %v", err)
+	}
+	if putResp.Success || putResp.Error != ErrNotLeader.Error() {
+		t.Fatalf("expected not-leader put response, got %+v", putResp)
 	}
 
-	putResp := s.HandleClientRequest(ClientRequest{Type: "put", Key: "k", Value: "v"})
-	if putResp.Success || putResp.Error != "not leader" {
-		t.Fatalf("expected put not leader error, got %+v", putResp)
+	delResp, err := api.Delete(context.Background(), &pb.KVRequest{Key: "k"})
+	if err != nil {
+		t.Fatalf("grpc delete returned rpc err: %v", err)
 	}
-
-	deleteResp := s.HandleClientRequest(ClientRequest{Type: "delete", Key: "k"})
-	if deleteResp.Success || deleteResp.Error != "not leader" {
-		t.Fatalf("expected delete not leader error, got %+v", deleteResp)
+	if delResp.Success || delResp.Error != ErrNotLeader.Error() {
+		t.Fatalf("expected not-leader delete response, got %+v", delResp)
 	}
 }
 
 func TestApplyCommittedEntriesUpdatesStoreAndSignalsPending(t *testing.T) {
-	s := &RaftKVServer{
-		store:   newTestStore(t),
-		pending: make(map[int]chan string),
-	}
+	s := newBareServer(t)
 
 	applyCh := make(chan raft.ApplyMsg, 4)
 	done := make(chan struct{})
@@ -113,13 +109,14 @@ func TestApplyCommittedEntriesUpdatesStoreAndSignalsPending(t *testing.T) {
 		close(done)
 	}()
 
-	putSignal := make(chan string, 1)
+	putSignal := make(chan error, 1)
 	s.pendingLock.Lock()
-	s.pending[1] = putSignal
+	s.pending[pendingKey{index: 1, term: 3}] = putSignal
 	s.pendingLock.Unlock()
 
 	applyCh <- raft.ApplyMsg{
 		Index: 1,
+		Term:  3,
 		Command: raft.Command{
 			Type:  "put",
 			Key:   "k",
@@ -128,7 +125,10 @@ func TestApplyCommittedEntriesUpdatesStoreAndSignalsPending(t *testing.T) {
 	}
 
 	select {
-	case <-putSignal:
+	case err := <-putSignal:
+		if err != nil {
+			t.Fatalf("unexpected put apply err: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for put apply notification")
 	}
@@ -141,13 +141,14 @@ func TestApplyCommittedEntriesUpdatesStoreAndSignalsPending(t *testing.T) {
 		t.Fatalf("expected value v got %q", string(got))
 	}
 
-	deleteSignal := make(chan string, 1)
+	delSignal := make(chan error, 1)
 	s.pendingLock.Lock()
-	s.pending[2] = deleteSignal
+	s.pending[pendingKey{index: 2, term: 3}] = delSignal
 	s.pendingLock.Unlock()
 
 	applyCh <- raft.ApplyMsg{
 		Index: 2,
+		Term:  3,
 		Command: raft.Command{
 			Type: "delete",
 			Key:  "k",
@@ -155,7 +156,10 @@ func TestApplyCommittedEntriesUpdatesStoreAndSignalsPending(t *testing.T) {
 	}
 
 	select {
-	case <-deleteSignal:
+	case err := <-delSignal:
+		if err != nil {
+			t.Fatalf("unexpected delete apply err: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for delete apply notification")
 	}
@@ -165,10 +169,10 @@ func TestApplyCommittedEntriesUpdatesStoreAndSignalsPending(t *testing.T) {
 		t.Fatalf("expected key not found after delete apply, got %v", err)
 	}
 
-	close(applyCh)
+	close(s.closedCh)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatalf("apply loop did not exit after channel close")
+		t.Fatalf("apply loop did not stop after close")
 	}
 }
