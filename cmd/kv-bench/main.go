@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"io"
+	"kvraft/common"
+	benchcluster "kvraft/internal/bench/cluster"
+	benchcompare "kvraft/internal/bench/compare"
+	benchreport "kvraft/internal/bench/report"
+	benchstorage "kvraft/internal/bench/storage"
+	benchworkload "kvraft/internal/bench/workload"
 	pb "kvraft/proto"
 	"log"
 	"math"
 	"math/rand"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -25,70 +28,6 @@ import (
 
 	"kvraft/kvstore"
 )
-
-type ClientRequest struct {
-	Type  string `json:"Type"`
-	Key   string `json:"Key"`
-	Value string `json:"Value"`
-}
-
-type ClientResponse struct {
-	Success bool   `json:"Success"`
-	Value   string `json:"Value"`
-	Error   string `json:"Error"`
-}
-
-type nodeProcess struct {
-	id         int
-	clientAddr string
-	cmd        *exec.Cmd
-	logFile    *os.File
-}
-
-func (n *nodeProcess) stop() error {
-	if n == nil || n.cmd == nil || n.cmd.Process == nil {
-		if n != nil && n.logFile != nil {
-			return n.logFile.Close()
-		}
-		return nil
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- n.cmd.Wait()
-	}()
-
-	_ = n.cmd.Process.Signal(os.Interrupt)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		_ = n.cmd.Process.Kill()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-		}
-	}
-
-	if n.logFile != nil {
-		if err := n.logFile.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-type cluster struct {
-	nodes       []*nodeProcess
-	clientAddrs []string
-}
-
-func (c *cluster) stopAll() {
-	for _, node := range c.nodes {
-		if err := node.stop(); err != nil {
-			log.Printf("warning: failed stopping node %d: %v", node.id, err)
-		}
-	}
-}
 
 type persistentClient struct {
 	address string
@@ -119,138 +58,27 @@ func (c *persistentClient) close() error {
 	return err
 }
 
-func (c *persistentClient) request(req ClientRequest) (ClientResponse, time.Duration, error) {
+func (c *persistentClient) request(req common.ClientRequest) (common.ClientResponse, time.Duration, error) {
 	start := time.Now()
-	resp, err := invokeKV(c.client, c.timeout, req)
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	resp, err := common.InvokeKV(ctx, c.client, req)
+	cancel()
 	if err != nil {
-		return ClientResponse{}, 0, err
+		return common.ClientResponse{}, 0, err
 	}
 	return resp, time.Since(start), nil
 }
 
-type raftBenchResult struct {
-	Writes               int       `json:"writes"`
-	LeaderAddr           string    `json:"leader_addr"`
-	MeanLatencyMS        float64   `json:"mean_latency_ms"`
-	P50LatencyMS         float64   `json:"p50_latency_ms"`
-	P95LatencyMS         float64   `json:"p95_latency_ms"`
-	P99LatencyMS         float64   `json:"p99_latency_ms"`
-	ConsistencySamples   int       `json:"consistency_samples"`
-	ConsistencyFailures  int       `json:"consistency_failures"`
-	LatencySamplesMS     []float64 `json:"latency_samples_ms"`
-	ConsistencyErrorText string    `json:"consistency_error,omitempty"`
-}
-
-type storageBenchResult struct {
-	DatasetDir             string    `json:"dataset_dir"`
-	DatasetKeys            int       `json:"dataset_keys"`
-	DatasetRounds          int       `json:"dataset_rounds"`
-	DatasetPayloadBytes    int       `json:"dataset_payload_bytes"`
-	PreMergeSizeBytes      int64     `json:"pre_merge_size_bytes"`
-	PostMergeSizeBytes     int64     `json:"post_merge_size_bytes"`
-	DiskReductionPercent   float64   `json:"disk_reduction_percent"`
-	RestartNoHintsMS       float64   `json:"restart_no_hints_ms"`
-	RestartWithHintsMS     float64   `json:"restart_with_hints_ms"`
-	RestartMergedHintsMS   float64   `json:"restart_merged_hints_ms"`
-	RestartImprovementPct  float64   `json:"restart_improvement_percent"`
-	OpenTrials             int       `json:"open_trials"`
-	OpenNoHintsSamplesMS   []float64 `json:"open_no_hints_samples_ms"`
-	OpenWithHintsSamplesMS []float64 `json:"open_with_hints_samples_ms"`
-	OpenMergedSamplesMS    []float64 `json:"open_merged_samples_ms"`
-}
-
-type claimChecks struct {
-	P99UnderTarget           bool    `json:"p99_under_target"`
-	RestartUnderTarget       bool    `json:"restart_under_target"`
-	DiskReductionWithinRange bool    `json:"disk_reduction_within_range"`
-	P99TargetMS              float64 `json:"p99_target_ms"`
-	RestartTargetMS          float64 `json:"restart_target_ms"`
-	DiskReductionMinPercent  float64 `json:"disk_reduction_min_percent"`
-	DiskReductionMaxPercent  float64 `json:"disk_reduction_max_percent"`
-	AllTargetsMet            bool    `json:"all_targets_met"`
-}
-
-type benchmarkReport struct {
-	GeneratedAtUTC string                `json:"generated_at_utc"`
-	Raft           raftBenchResult       `json:"raft"`
-	Storage        storageBenchResult    `json:"storage"`
-	EtcdComparison *etcdComparisonResult `json:"etcd_comparison,omitempty"`
-	Checks         claimChecks           `json:"checks"`
-}
-
-type latencySummary struct {
-	Samples      int       `json:"samples"`
-	MeanLatency  float64   `json:"mean_latency_ms"`
-	P50Latency   float64   `json:"p50_latency_ms"`
-	P95Latency   float64   `json:"p95_latency_ms"`
-	P99Latency   float64   `json:"p99_latency_ms"`
-	MaxLatency   float64   `json:"max_latency_ms"`
-	StdDev       float64   `json:"stddev_latency_ms"`
-	LatencyTrace []float64 `json:"latency_samples_ms,omitempty"`
-}
-
-type loadScenarioResult struct {
-	Name             string    `json:"name"`
-	Workers          int       `json:"workers"`
-	DurationSeconds  float64   `json:"duration_seconds"`
-	Requests         int       `json:"requests"`
-	Successes        int       `json:"successes"`
-	Failures         int       `json:"failures"`
-	ThroughputRPS    float64   `json:"throughput_rps"`
-	MeanLatencyMS    float64   `json:"mean_latency_ms"`
-	P50LatencyMS     float64   `json:"p50_latency_ms"`
-	P95LatencyMS     float64   `json:"p95_latency_ms"`
-	P99LatencyMS     float64   `json:"p99_latency_ms"`
-	SlowestLatencyMS float64   `json:"slowest_latency_ms"`
-	StdDevLatencyMS  float64   `json:"stddev_latency_ms"`
-	LatencySamplesMS []float64 `json:"latency_samples_ms,omitempty"`
-}
-
-type diskLatencyResult struct {
-	WALFsync                 latencySummary `json:"wal_fsync"`
-	BackendCommit            latencySummary `json:"backend_commit"`
-	WALP99TargetMS           float64        `json:"wal_p99_target_ms"`
-	BackendCommitTargetMS    float64        `json:"backend_commit_target_ms"`
-	WALP99UnderTarget        bool           `json:"wal_p99_under_target"`
-	BackendCommitUnderTarget bool           `json:"backend_commit_under_target"`
-}
-
-type checkPerfModelResult struct {
-	Model              string             `json:"model"`
-	MinThroughputRPS   float64            `json:"min_throughput_rps"`
-	SlowestTargetMS    float64            `json:"slowest_target_ms"`
-	StdDevTargetMS     float64            `json:"stddev_target_ms"`
-	Result             loadScenarioResult `json:"result"`
-	ThroughputPass     bool               `json:"throughput_pass"`
-	SlowestLatencyPass bool               `json:"slowest_latency_pass"`
-	LatencyStdDevPass  bool               `json:"latency_stddev_pass"`
-	AllPass            bool               `json:"all_pass"`
-}
-
-type etcdTargetCheck struct {
-	Name       string  `json:"name"`
-	Actual     float64 `json:"actual"`
-	Target     float64 `json:"target"`
-	Comparator string  `json:"comparator"`
-	Pass       bool    `json:"pass"`
-}
-
-type etcdComparisonResult struct {
-	KeyBytes         int                    `json:"key_bytes"`
-	ValueBytes       int                    `json:"value_bytes"`
-	ReadKeyspace     int                    `json:"read_keyspace"`
-	WorkloadSeconds  int                    `json:"workload_seconds"`
-	WriteLeader      loadScenarioResult     `json:"write_leader_targeted"`
-	WriteAllMembers  loadScenarioResult     `json:"write_all_members_targeted"`
-	ReadLinearizable loadScenarioResult     `json:"read_linearizable"`
-	ReadSerializable loadScenarioResult     `json:"read_serializable"`
-	LightLoadPut     latencySummary         `json:"light_load_put"`
-	LightLoadGet     latencySummary         `json:"light_load_get"`
-	DiskLatency      diskLatencyResult      `json:"disk_latency"`
-	CheckPerf        []checkPerfModelResult `json:"check_perf"`
-	TargetChecks     []etcdTargetCheck      `json:"target_checks"`
-	AllTargetsMet    bool                   `json:"all_targets_met"`
-}
+type raftBenchResult = benchreport.RaftBenchResult
+type storageBenchResult = benchreport.StorageBenchResult
+type claimChecks = benchreport.ClaimChecks
+type benchmarkReport = benchreport.BenchmarkReport
+type latencySummary = benchreport.LatencySummary
+type loadScenarioResult = benchreport.LoadScenarioResult
+type diskLatencyResult = benchreport.DiskLatencyResult
+type checkPerfModelResult = benchreport.CheckPerfModelResult
+type etcdTargetCheck = benchreport.EtcdTargetCheck
+type etcdComparisonResult = benchreport.EtcdComparisonResult
 
 type etcdComparisonConfig struct {
 	WorkloadDuration   time.Duration
@@ -345,6 +173,8 @@ func main() {
 		etcdDiskCommitSamples   = flag.Int("etcd-disk-commit-samples", 200, "Number of explicit Sync samples for backend commit proxy")
 		etcdDiskCommitBatch     = flag.Int("etcd-disk-commit-batch", 32, "Number of puts between backend commit Sync samples")
 		etcdCheckPerfSec        = flag.Int("etcd-check-perf-sec", 10, "Duration in seconds for each etcdctl check-perf model")
+		baselinePath            = flag.String("baseline", "", "Optional baseline JSON path for no-regression comparison")
+		strictEtcdTargets       = flag.Bool("strict-etcd-targets", false, "When strict mode is enabled, also require etcd reference targets to pass")
 		strict                  = flag.Bool("strict", false, "Exit non-zero if one or more claim targets fail")
 	)
 	flag.Parse()
@@ -383,7 +213,7 @@ func main() {
 
 	log.Printf("benchmark workdir: %s", runDir)
 
-	c, err := startCluster(binPath, runDir, 3)
+	c, err := benchcluster.Start(binPath, runDir, 3)
 	if err != nil {
 		log.Fatalf("start cluster: %v", err)
 	}
@@ -391,18 +221,18 @@ func main() {
 	clusterRunning := true
 	defer func() {
 		if clusterRunning {
-			c.stopAll()
+			c.StopAll()
 		}
 	}()
 
-	raftResult, err := runRaftBenchmark(c.clientAddrs, *writes, *latencyPayloadBytes, *consistencySample)
+	raftResult, err := runRaftBenchmark(c.ClientAddrs, *writes, *latencyPayloadBytes, *consistencySample)
 	if err != nil {
 		log.Fatalf("raft benchmark failed: %v", err)
 	}
 
 	var etcdResult *etcdComparisonResult
 	if *etcdCompare {
-		result, err := runEtcdComparisonBenchmark(c.clientAddrs, runDir, etcdComparisonConfig{
+		result, err := runEtcdComparisonBenchmark(c.ClientAddrs, runDir, etcdComparisonConfig{
 			WorkloadDuration:   time.Duration(*etcdDurationSec) * time.Second,
 			WriteWorkers:       *etcdWriteWorkers,
 			ReadWorkers:        *etcdReadWorkers,
@@ -422,10 +252,10 @@ func main() {
 	}
 
 	// Stop server processes before local storage benchmarking to keep noise and disk contention low.
-	c.stopAll()
+	c.StopAll()
 	clusterRunning = false
 
-	storageResult, err := runStorageBenchmark(runDir, *datasetKeys, *datasetRounds, *datasetPayloadBytes, int64(*datasetMaxFileMB)*1024*1024, *restartTrials)
+	storageResult, err := benchstorage.Run(runDir, *datasetKeys, *datasetRounds, *datasetPayloadBytes, int64(*datasetMaxFileMB)*1024*1024, *restartTrials)
 	if err != nil {
 		log.Fatalf("storage benchmark failed: %v", err)
 	}
@@ -449,6 +279,16 @@ func main() {
 		Checks:         checks,
 	}
 
+	var baselineResult *benchcompare.Result
+	if *baselinePath != "" {
+		base, err := benchcompare.LoadBaseline(*baselinePath)
+		if err != nil {
+			log.Fatalf("load baseline: %v", err)
+		}
+		res := benchcompare.Compare(report, *baselinePath, base)
+		baselineResult = &res
+	}
+
 	encoded, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		log.Fatalf("marshal report: %v", err)
@@ -468,103 +308,30 @@ func main() {
 		fmt.Printf("  disk SLO proxy: wal p99 %.2fms (<10ms), backend commit p99 %.2fms (<25ms)\n", etcdResult.DiskLatency.WALFsync.P99Latency, etcdResult.DiskLatency.BackendCommit.P99Latency)
 		fmt.Printf("  etcd comparison targets met: %v\n", etcdResult.AllTargetsMet)
 	}
+	if baselineResult != nil {
+		fmt.Printf("  baseline comparison (%s): %v\n", baselineResult.BaselinePath, baselineResult.AllPass)
+		for _, c := range baselineResult.Checks {
+			fmt.Printf("    - %s: %.3f %s %.3f => %v\n", c.Name, c.Actual, c.Comparator, c.Threshold, c.Pass)
+		}
+	}
 	fmt.Printf("  artifacts dir: %s\n", runDir)
 
 	if *strict {
 		allTargets := checks.AllTargetsMet
-		if etcdResult != nil {
+		if baselineResult != nil {
+			// No-regression mode focuses on latency/throughput drift and disk SLO proxies.
+			allTargets = checks.P99UnderTarget && checks.RestartUnderTarget
+		}
+		if etcdResult != nil && *strictEtcdTargets {
 			allTargets = allTargets && etcdResult.AllTargetsMet
+		}
+		if baselineResult != nil {
+			allTargets = allTargets && baselineResult.AllPass
 		}
 		if !allTargets {
 			os.Exit(1)
 		}
 	}
-}
-
-func startCluster(serverBin, runDir string, n int) (*cluster, error) {
-	raftPorts, err := reserveFreePorts(n)
-	if err != nil {
-		return nil, err
-	}
-	clientPorts, err := reserveFreePorts(n)
-	if err != nil {
-		return nil, err
-	}
-
-	raftAddrs := make([]string, 0, n)
-	for _, p := range raftPorts {
-		raftAddrs = append(raftAddrs, "127.0.0.1:"+strconv.Itoa(p))
-	}
-	clientAddrs := make([]string, 0, n)
-	for _, p := range clientPorts {
-		clientAddrs = append(clientAddrs, "127.0.0.1:"+strconv.Itoa(p))
-	}
-
-	peersFlag := strings.Join(raftAddrs, ",")
-
-	nodes := make([]*nodeProcess, 0, n)
-	for i := 0; i < n; i++ {
-		logPath := filepath.Join(runDir, fmt.Sprintf("node%d.log", i))
-		lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-		if err != nil {
-			for _, node := range nodes {
-				_ = node.stop()
-			}
-			return nil, fmt.Errorf("open log file for node %d: %w", i, err)
-		}
-
-		cmd := exec.Command(
-			serverBin,
-			"-id="+strconv.Itoa(i),
-			"-port="+strconv.Itoa(raftPorts[i]),
-			"-client-port="+strconv.Itoa(clientPorts[i]),
-			"-peers="+peersFlag,
-		)
-		cmd.Dir = runDir
-		cmd.Stdout = lf
-		cmd.Stderr = lf
-
-		if err := cmd.Start(); err != nil {
-			_ = lf.Close()
-			for _, node := range nodes {
-				_ = node.stop()
-			}
-			return nil, fmt.Errorf("start node %d: %w", i, err)
-		}
-
-		nodes = append(nodes, &nodeProcess{id: i, clientAddr: clientAddrs[i], cmd: cmd, logFile: lf})
-	}
-
-	return &cluster{nodes: nodes, clientAddrs: clientAddrs}, nil
-}
-
-func reserveFreePorts(n int) ([]int, error) {
-	ports := make([]int, 0, n)
-	listeners := make([]net.Listener, 0, n)
-	seen := make(map[int]struct{})
-
-	for len(ports) < n {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			for _, l := range listeners {
-				_ = l.Close()
-			}
-			return nil, err
-		}
-		port := ln.Addr().(*net.TCPAddr).Port
-		if _, ok := seen[port]; ok {
-			_ = ln.Close()
-			continue
-		}
-		seen[port] = struct{}{}
-		listeners = append(listeners, ln)
-		ports = append(ports, port)
-	}
-
-	for _, ln := range listeners {
-		_ = ln.Close()
-	}
-	return ports, nil
 }
 
 func runRaftBenchmark(addresses []string, writes, payloadBytes, consistencySample int) (raftBenchResult, error) {
@@ -602,7 +369,7 @@ func runRaftBenchmark(addresses []string, writes, payloadBytes, consistencySampl
 		leader = leaderOut
 		latenciesMS = append(latenciesMS, float64(latency.Microseconds())/1000.0)
 
-		resp, _, err := sendRequest(leader, ClientRequest{Type: "get", Key: key}, 1500*time.Millisecond)
+		resp, _, err := sendRequest(leader, common.ClientRequest{Type: common.OpGet, Key: key}, 1500*time.Millisecond)
 		if err != nil {
 			return raftBenchResult{}, fmt.Errorf("leader read-after-write failed for key %s: %w", key, err)
 		}
@@ -650,7 +417,7 @@ func discoverLeader(addresses []string, timeout time.Duration) (string, error) {
 
 	for time.Now().Before(deadline) {
 		for _, addr := range addresses {
-			resp, _, err := sendRequest(addr, ClientRequest{Type: "put", Key: "__bench_leader_probe__", Value: probeValue}, 1500*time.Millisecond)
+			resp, _, err := sendRequest(addr, common.ClientRequest{Type: common.OpPut, Key: "__bench_leader_probe__", Value: probeValue}, 1500*time.Millisecond)
 			if err != nil {
 				continue
 			}
@@ -690,7 +457,7 @@ func putWithRetryPersistent(addresses []string, leader *string, client **persist
 			*client = newClient
 		}
 
-		resp, d, err := (*client).request(ClientRequest{Type: "put", Key: key, Value: value})
+		resp, d, err := (*client).request(common.ClientRequest{Type: common.OpPut, Key: key, Value: value})
 		if err == nil && resp.Success {
 			return d, *leader, nil
 		}
@@ -718,7 +485,7 @@ func waitForReplication(addresses []string, key, expected string, timeout time.D
 	for time.Now().Before(deadline) {
 		allMatch := true
 		for _, addr := range addresses {
-			resp, _, err := sendRequest(addr, ClientRequest{Type: "get", Key: key}, 1200*time.Millisecond)
+			resp, _, err := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: key}, 1200*time.Millisecond)
 			if err != nil || !resp.Success || resp.Value != expected {
 				allMatch = false
 				break
@@ -733,48 +500,22 @@ func waitForReplication(addresses []string, key, expected string, timeout time.D
 	return fmt.Errorf("replication timeout for key %s", key)
 }
 
-func sendRequest(address string, req ClientRequest, timeout time.Duration) (ClientResponse, time.Duration, error) {
+func sendRequest(address string, req common.ClientRequest, timeout time.Duration) (common.ClientResponse, time.Duration, error) {
 	start := time.Now()
 	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return ClientResponse{}, 0, err
+		return common.ClientResponse{}, 0, err
 	}
 	defer conn.Close()
 
 	client := pb.NewKVServiceClient(conn)
-	resp, err := invokeKV(client, timeout, req)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	resp, err := common.InvokeKV(ctx, client, req)
+	cancel()
 	if err != nil {
-		return ClientResponse{}, 0, err
+		return common.ClientResponse{}, 0, err
 	}
 	return resp, time.Since(start), nil
-}
-
-func invokeKV(client pb.KVServiceClient, timeout time.Duration, req ClientRequest) (ClientResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	switch req.Type {
-	case "get":
-		resp, err := client.Get(ctx, &pb.KVRequest{Key: req.Key})
-		if err != nil {
-			return ClientResponse{}, err
-		}
-		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
-	case "put":
-		resp, err := client.Put(ctx, &pb.KVRequest{Key: req.Key, Value: req.Value})
-		if err != nil {
-			return ClientResponse{}, err
-		}
-		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
-	case "delete":
-		resp, err := client.Delete(ctx, &pb.KVRequest{Key: req.Key})
-		if err != nil {
-			return ClientResponse{}, err
-		}
-		return ClientResponse{Success: resp.Success, Value: resp.Value, Error: resp.Error}, nil
-	default:
-		return ClientResponse{Success: false, Error: "unknown command"}, nil
-	}
 }
 
 func runEtcdComparisonBenchmark(addresses []string, runDir string, cfg etcdComparisonConfig) (etcdComparisonResult, error) {
@@ -1026,8 +767,8 @@ func preloadReadDataset(addresses []string, leaderHint string, keyCount, payload
 	defer writeClient.close()
 
 	for i := 0; i < keyCount; i++ {
-		key := fixedKey(uint64(i))
-		value := fixedPayload(payloadBytes, uint64(i))
+		key := benchworkload.FixedKey(uint64(i))
+		value := benchworkload.FixedPayload(payloadBytes, uint64(i))
 		_, leaderOut, err := putWithRetryPersistent(addresses, &leader, &writeClient, key, value)
 		if err != nil {
 			return nil, "", err
@@ -1042,7 +783,7 @@ func preloadReadDataset(addresses []string, leaderHint string, keyCount, payload
 		samples = len(keys)
 	}
 	for _, key := range keys[len(keys)-samples:] {
-		if err := waitForReplication(addresses, key, fixedPayload(payloadBytes, uint64(parseHexKey(key))), 4*time.Second); err != nil {
+		if err := waitForReplication(addresses, key, benchworkload.FixedPayload(payloadBytes, uint64(parseHexKey(key))), 4*time.Second); err != nil {
 			return nil, "", err
 		}
 	}
@@ -1125,13 +866,13 @@ func executeLoadOperation(pool *workerClientPool, cfg loadScenarioConfig, leader
 	switch cfg.Mode {
 	case loadModeWriteLeader:
 		keyID := atomic.AddUint64(keyCounter, 1) - 1
-		key := fixedKey(keyID)
-		return writeLeader(pool, cfg.Addresses, leaderRef, key, fixedPayload(cfg.PayloadBytes, keyID))
+		key := benchworkload.FixedKey(keyID)
+		return writeLeader(pool, cfg.Addresses, leaderRef, key, benchworkload.FixedPayload(cfg.PayloadBytes, keyID))
 	case loadModeWriteAllMembers:
 		keyID := atomic.AddUint64(keyCounter, 1) - 1
-		key := fixedKey(keyID)
+		key := benchworkload.FixedKey(keyID)
 		target := cfg.Addresses[int((atomic.AddUint64(roundRobin, 1)-1)%uint64(len(cfg.Addresses)))]
-		return writeAllMembers(pool, cfg.Addresses, leaderRef, target, key, fixedPayload(cfg.PayloadBytes, keyID))
+		return writeAllMembers(pool, cfg.Addresses, leaderRef, target, key, benchworkload.FixedPayload(cfg.PayloadBytes, keyID))
 	case loadModeReadLeader:
 		key := cfg.ReadKeys[rng.Intn(len(cfg.ReadKeys))]
 		return readLeader(pool, cfg.Addresses, leaderRef, key)
@@ -1159,12 +900,12 @@ func writeLeader(pool *workerClientPool, addresses []string, leaderRef *atomic.V
 			leaderRef.Store(leader)
 		}
 
-		resp, err := pool.request(leader, ClientRequest{Type: "put", Key: key, Value: value})
+		resp, err := pool.request(leader, common.ClientRequest{Type: common.OpPut, Key: key, Value: value})
 		if err == nil && resp.Success {
 			leaderRef.Store(leader)
 			return true
 		}
-		if err != nil || isNotLeader(resp.Error) {
+		if err != nil || benchworkload.IsNotLeader(resp.Error) {
 			leaderRef.Store("")
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1173,11 +914,11 @@ func writeLeader(pool *workerClientPool, addresses []string, leaderRef *atomic.V
 }
 
 func writeAllMembers(pool *workerClientPool, addresses []string, leaderRef *atomic.Value, firstTarget, key, value string) bool {
-	resp, err := pool.request(firstTarget, ClientRequest{Type: "put", Key: key, Value: value})
+	resp, err := pool.request(firstTarget, common.ClientRequest{Type: common.OpPut, Key: key, Value: value})
 	if err == nil && resp.Success {
 		return true
 	}
-	if err != nil || isNotLeader(resp.Error) {
+	if err != nil || benchworkload.IsNotLeader(resp.Error) {
 		return writeLeader(pool, addresses, leaderRef, key, value)
 	}
 	return false
@@ -1198,11 +939,11 @@ func readLeader(pool *workerClientPool, addresses []string, leaderRef *atomic.Va
 			leaderRef.Store(leader)
 		}
 
-		resp, err := pool.request(leader, ClientRequest{Type: "get", Key: key})
+		resp, err := pool.request(leader, common.ClientRequest{Type: common.OpGet, Key: key})
 		if err == nil && resp.Success {
 			return true
 		}
-		if err != nil || isNotLeader(resp.Error) {
+		if err != nil || benchworkload.IsNotLeader(resp.Error) {
 			leaderRef.Store("")
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1211,7 +952,7 @@ func readLeader(pool *workerClientPool, addresses []string, leaderRef *atomic.Va
 }
 
 func readTarget(pool *workerClientPool, target, key string) bool {
-	resp, err := pool.request(target, ClientRequest{Type: "get", Key: key})
+	resp, err := pool.request(target, common.ClientRequest{Type: common.OpGet, Key: key})
 	return err == nil && resp.Success
 }
 
@@ -1227,8 +968,8 @@ func runLightLoadProbe(addresses []string, leader string, payloadBytes, ops int)
 
 	for i := 0; i < ops; i++ {
 		keyID := uint64(0x70000000 + i)
-		key := fixedKey(keyID)
-		value := fixedPayload(payloadBytes, keyID)
+		key := benchworkload.FixedKey(keyID)
+		value := benchworkload.FixedPayload(payloadBytes, keyID)
 
 		putStart := time.Now()
 		if !writeLeader(pool, addresses, &leaderRef, key, value) {
@@ -1265,7 +1006,7 @@ func runDiskLatencyProbe(runDir string, payloadBytes, walSamples, commitSamples,
 	for i := 0; i < walSamples; i++ {
 		keyID := uint64(0x80000000 + i)
 		start := time.Now()
-		if err := walDB.Put(fixedKey(keyID), fixedPayload(payloadBytes, keyID)); err != nil {
+		if err := walDB.Put(benchworkload.FixedKey(keyID), benchworkload.FixedPayload(payloadBytes, keyID)); err != nil {
 			_ = walDB.Close()
 			return diskLatencyResult{}, err
 		}
@@ -1293,7 +1034,7 @@ func runDiskLatencyProbe(runDir string, payloadBytes, walSamples, commitSamples,
 	keyID := uint64(0x90000000)
 	for i := 0; i < commitSamples; i++ {
 		for j := 0; j < commitBatch; j++ {
-			if err := commitDB.Put(fixedKey(keyID), fixedPayload(payloadBytes, keyID)); err != nil {
+			if err := commitDB.Put(benchworkload.FixedKey(keyID), benchworkload.FixedPayload(payloadBytes, keyID)); err != nil {
 				_ = commitDB.Close()
 				return diskLatencyResult{}, err
 			}
@@ -1431,25 +1172,6 @@ func stdDev(values []float64) float64 {
 	return math.Sqrt(sum / float64(len(values)))
 }
 
-func isNotLeader(errText string) bool {
-	return strings.Contains(strings.ToLower(errText), "not leader")
-}
-
-func fixedKey(id uint64) string {
-	return fmt.Sprintf("%08x", uint32(id))
-}
-
-func fixedPayload(payloadBytes int, seed uint64) string {
-	if payloadBytes <= 0 {
-		return ""
-	}
-	prefix := fmt.Sprintf("%08x", uint32(seed))
-	if payloadBytes <= len(prefix) {
-		return prefix[:payloadBytes]
-	}
-	return prefix + strings.Repeat("v", payloadBytes-len(prefix))
-}
-
 type workerClientPool struct {
 	timeout time.Duration
 	clients map[string]*persistentClient
@@ -1462,12 +1184,12 @@ func newWorkerClientPool(timeout time.Duration) *workerClientPool {
 	}
 }
 
-func (p *workerClientPool) request(address string, req ClientRequest) (ClientResponse, error) {
+func (p *workerClientPool) request(address string, req common.ClientRequest) (common.ClientResponse, error) {
 	client := p.clients[address]
 	if client == nil {
 		c, err := newPersistentClient(address, p.timeout)
 		if err != nil {
-			return ClientResponse{}, err
+			return common.ClientResponse{}, err
 		}
 		p.clients[address] = c
 		client = c
@@ -1477,7 +1199,7 @@ func (p *workerClientPool) request(address string, req ClientRequest) (ClientRes
 	if err != nil {
 		_ = client.close()
 		delete(p.clients, address)
-		return ClientResponse{}, err
+		return common.ClientResponse{}, err
 	}
 	return resp, nil
 }
@@ -1495,260 +1217,6 @@ func parseHexKey(key string) uint64 {
 		return 0
 	}
 	return parsed
-}
-
-func runStorageBenchmark(runDir string, keys, rounds, payloadBytes int, maxDataFileSizeBytes int64, trials int) (storageBenchResult, error) {
-	if keys <= 0 || rounds <= 0 || payloadBytes <= 0 {
-		return storageBenchResult{}, fmt.Errorf("dataset keys, rounds, and payload bytes must all be > 0")
-	}
-	if maxDataFileSizeBytes <= 0 {
-		return storageBenchResult{}, fmt.Errorf("dataset max data file size must be > 0")
-	}
-	if trials <= 0 {
-		return storageBenchResult{}, fmt.Errorf("restart trials must be > 0")
-	}
-
-	datasetSrc := filepath.Join(runDir, "storage_dataset_src")
-	if err := os.RemoveAll(datasetSrc); err != nil {
-		return storageBenchResult{}, err
-	}
-	if err := buildSyntheticDataset(datasetSrc, keys, rounds, payloadBytes, maxDataFileSizeBytes); err != nil {
-		return storageBenchResult{}, err
-	}
-
-	withHints := filepath.Join(runDir, "storage_with_hints")
-	noHints := filepath.Join(runDir, "storage_no_hints")
-	merged := filepath.Join(runDir, "storage_merged")
-
-	// Clone the same dataset for baseline and optimized paths so the comparison is apples-to-apples.
-	if err := copyDir(datasetSrc, withHints); err != nil {
-		return storageBenchResult{}, err
-	}
-	if err := copyDir(datasetSrc, noHints); err != nil {
-		return storageBenchResult{}, err
-	}
-	if err := copyDir(datasetSrc, merged); err != nil {
-		return storageBenchResult{}, err
-	}
-
-	if err := removeHintFiles(noHints); err != nil {
-		return storageBenchResult{}, err
-	}
-
-	preMergeSize, err := dirSizeBytes(merged)
-	if err != nil {
-		return storageBenchResult{}, err
-	}
-
-	if err := mergeDirectory(merged); err != nil {
-		return storageBenchResult{}, err
-	}
-
-	postMergeSize, err := dirSizeBytes(merged)
-	if err != nil {
-		return storageBenchResult{}, err
-	}
-
-	noHintsSamples, err := measureOpenSamples(noHints, trials)
-	if err != nil {
-		return storageBenchResult{}, err
-	}
-	withHintsSamples, err := measureOpenSamples(withHints, trials)
-	if err != nil {
-		return storageBenchResult{}, err
-	}
-	mergedSamples, err := measureOpenSamples(merged, trials)
-	if err != nil {
-		return storageBenchResult{}, err
-	}
-
-	sortedNoHints := append([]float64(nil), noHintsSamples...)
-	sortedWithHints := append([]float64(nil), withHintsSamples...)
-	sortedMerged := append([]float64(nil), mergedSamples...)
-	sort.Float64s(sortedNoHints)
-	sort.Float64s(sortedWithHints)
-	sort.Float64s(sortedMerged)
-
-	restartNoHints := percentile(sortedNoHints, 0.50)
-	restartWithHints := percentile(sortedWithHints, 0.50)
-	restartMerged := percentile(sortedMerged, 0.50)
-
-	diskReductionPct := 0.0
-	if preMergeSize > 0 {
-		diskReductionPct = (float64(preMergeSize-postMergeSize) / float64(preMergeSize)) * 100
-	}
-
-	restartImprovement := 0.0
-	if restartNoHints > 0 {
-		restartImprovement = (restartNoHints - restartMerged) / restartNoHints * 100
-	}
-
-	return storageBenchResult{
-		DatasetDir:             datasetSrc,
-		DatasetKeys:            keys,
-		DatasetRounds:          rounds,
-		DatasetPayloadBytes:    payloadBytes,
-		PreMergeSizeBytes:      preMergeSize,
-		PostMergeSizeBytes:     postMergeSize,
-		DiskReductionPercent:   diskReductionPct,
-		RestartNoHintsMS:       restartNoHints,
-		RestartWithHintsMS:     restartWithHints,
-		RestartMergedHintsMS:   restartMerged,
-		RestartImprovementPct:  restartImprovement,
-		OpenTrials:             trials,
-		OpenNoHintsSamplesMS:   sortedNoHints,
-		OpenWithHintsSamplesMS: sortedWithHints,
-		OpenMergedSamplesMS:    sortedMerged,
-	}, nil
-}
-
-func buildSyntheticDataset(dir string, keys, rounds, payloadBytes int, maxDataFileSizeBytes int64) error {
-	db, err := kvstore.OpenWithOptions(dir, kvstore.OpenOptions{
-		ReadWrite:            true,
-		SyncOnPut:            false,
-		MaxDataFileSizeBytes: maxDataFileSizeBytes,
-	})
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	payload := strings.Repeat("v", payloadBytes)
-	for r := 0; r < rounds; r++ {
-		for k := 0; k < keys; k++ {
-			key := fmt.Sprintf("dataset-%08d", k)
-			value := fmt.Sprintf("r%02d:%s", r, payload)
-			if err := db.Put(key, value); err != nil {
-				return err
-			}
-		}
-	}
-
-	return db.Sync()
-}
-
-func copyDir(src, dst string) error {
-	if err := os.RemoveAll(dst); err != nil {
-		return err
-	}
-
-	return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-
-		if d.IsDir() {
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			return os.MkdirAll(target, info.Mode().Perm())
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-
-		in, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
-		if err != nil {
-			_ = in.Close()
-			return err
-		}
-
-		if _, err := io.Copy(out, in); err != nil {
-			_ = in.Close()
-			_ = out.Close()
-			return err
-		}
-		if err := in.Close(); err != nil {
-			_ = out.Close()
-			return err
-		}
-		return out.Close()
-	})
-}
-
-func removeHintFiles(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if strings.HasSuffix(entry.Name(), ".hint") {
-			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func mergeDirectory(dir string) error {
-	db, err := kvstore.OpenWithOptions(dir, kvstore.OpenOptions{ReadWrite: true})
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	if err := db.Merge(); err != nil {
-		return err
-	}
-	return db.Sync()
-}
-
-func dirSizeBytes(dir string) (int64, error) {
-	var total int64
-	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if info.Mode().IsRegular() {
-			total += info.Size()
-		}
-		return nil
-	})
-	return total, err
-}
-
-func measureOpenSamples(dir string, trials int) ([]float64, error) {
-	samples := make([]float64, 0, trials)
-	for i := 0; i < trials; i++ {
-		start := time.Now()
-		db, err := kvstore.OpenReadOnly(dir)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.Close(); err != nil {
-			return nil, err
-		}
-		samples = append(samples, float64(time.Since(start).Microseconds())/1000.0)
-	}
-	return samples, nil
 }
 
 func percentile(sorted []float64, q float64) float64 {
