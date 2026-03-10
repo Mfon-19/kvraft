@@ -66,18 +66,6 @@ go run ./cmd/kv-test
 
 Local node data is written to `kvstore_<id>/` by default. For a clean local restart, remove those directories after stopping the servers.
 
-## Releases
-
-Tagged releases publish cross-platform binaries via GitHub Releases:
-- `caskv-server` for running cluster nodes
-- `caskv-client` for interactive `Get`/`Put`/`Delete`
-
-Version check:
-```bash
-./caskv-server -version
-./caskv-client -version
-```
-
 ## Semantics And Limitations
 
 Semantics:
@@ -119,7 +107,6 @@ Benchmark flow:
 
 ## Benchmark Methodology
 
-`cmd/kv-bench` now covers the native benchmarks that map directly to this codebase:
 - leader-targeted write latency with leader read-after-write verification
 - leader visibility checks for recently written keys
 - storage restart/open time across no-hint, hint, and merged-hint datasets
@@ -150,18 +137,6 @@ The snapshot below reflects a local run on March 10, 2026.
 - Restart time (merged+hints median): **40.55 ms**
 - Disk reduction after merge: **50.17%**
 
-## Mixed-Workload Benchmarking
-
-The previous etcd-style throughput suite has been removed. It no longer matched the project semantics after reads became leader-only linearizable operations.
-
-For mixed read/write benchmarking, the recommended path is now YCSB with a custom `kvraft` binding.
-
-See [`bench/ycsb/README.md`](bench/ycsb/README.md) for:
-- the supported YCSB workload set
-- the record-to-key mapping model
-- run commands and environment variables
-- reporting constraints for this API
-
 ### YCSB Methodology
 
 The local YCSB sweep below was run on March 10, 2026 on a single Linux machine with `8` CPUs and `7.5 GiB` RAM.
@@ -185,8 +160,6 @@ Methodology details:
 - each point loaded a fresh dataset before running workloads
 - the YCSB binding targeted the current leader directly
 - `F` is the most expensive workload here because YCSB read-modify-write becomes `Get` plus `Put` against a linearizable store
-
-Raw artifacts for this sweep are stored under `benchmark-artifacts/2026-03-10/ycsb-sweep-1773169630/`.
 
 ### 32 Vs 64 Threads
 
