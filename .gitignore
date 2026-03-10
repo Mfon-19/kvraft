@@ -27,6 +27,7 @@ cmd/testdb/
 /newdir/
 /main.py
 /sample.txt
+/docs/
 
 *.test
 *.prof

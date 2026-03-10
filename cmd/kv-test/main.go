@@ -43,6 +43,11 @@ func main() {
 				log.Printf("\t✓ Leader found at %s", addr)
 				break
 			}
+			if err == nil && !resp.Success && resp.Error == "not leader" && resp.Leader != "" {
+				leaderAddr = resp.Leader
+				log.Printf("\t✓ Leader hinted at %s by %s", leaderAddr, addr)
+				break
+			}
 		}
 		if leaderAddr != "" {
 			break

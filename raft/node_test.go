@@ -188,6 +188,9 @@ func TestHandleAppendEntriesTruncatesConflictAndUpdatesCommit(t *testing.T) {
 	if n.state != Follower {
 		t.Fatalf("expected follower state, got %v", n.state)
 	}
+	if n.LeaderID() != 1 {
+		t.Fatalf("expected leader id 1 got %d", n.LeaderID())
+	}
 	if len(n.log) != 4 {
 		t.Fatalf("expected log len=4 got %d", len(n.log))
 	}
@@ -245,6 +248,9 @@ func TestSubmitLeaderOnlyAndAppend(t *testing.T) {
 	n.state = Leader
 	n.currentTerm = 5
 	n.becomeLeaderLocked()
+	if n.LeaderID() != 0 {
+		t.Fatalf("expected leader id 0 got %d", n.LeaderID())
+	}
 
 	index, term, ok := n.Submit(Command{Type: "put", Key: "k", Value: "v"})
 	if !ok {
@@ -285,5 +291,8 @@ func TestSendHeartbeatsStepDownOnHigherTermReply(t *testing.T) {
 	}
 	if n.currentTerm != 5 {
 		t.Fatalf("expected term=5 got %d", n.currentTerm)
+	}
+	if n.LeaderID() != -1 {
+		t.Fatalf("expected leader id reset after stepping down, got %d", n.LeaderID())
 	}
 }

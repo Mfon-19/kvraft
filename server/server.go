@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,9 +28,11 @@ const commandTypeReadBarrier = "read_barrier"
 const maxCompletedNotifications = 1024
 
 type Config struct {
-	ID          int
-	RaftAddress string
-	Peers       []string
+	ID            int
+	RaftAddress   string
+	ClientAddress string
+	Peers         []string
+	ClientPeers   []string
 
 	StoreDir     string
 	StoreOptions kvstore.OpenOptions
@@ -47,12 +51,14 @@ type raftBackend interface {
 	HandleAppendEntries(args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply)
 	Submit(cmd raft.Command) (int, int, bool)
 	IsLeader() bool
+	LeaderID() int
 	Shutdown()
 }
 
 type RaftKVServer struct {
-	id      int
-	address string
+	id            int
+	address       string
+	clientAddress string
 
 	raftNode raftBackend
 	store    *kvstore.DB
@@ -68,6 +74,7 @@ type RaftKVServer struct {
 	completionQ []pendingKey
 
 	commitTimeout time.Duration
+	clientPeers   map[int]string
 	closedCh      chan struct{}
 	closeOnce     sync.Once
 	applyWg       sync.WaitGroup
@@ -87,11 +94,16 @@ func NewRaftKVServer(cfg Config) (*RaftKVServer, error) {
 	s := &RaftKVServer{
 		id:            cfg.ID,
 		address:       cfg.RaftAddress,
+		clientAddress: cfg.ClientAddress,
 		store:         open,
 		pending:       make(map[pendingKey]chan error),
 		completed:     make(map[pendingKey]error),
 		commitTimeout: cfg.CommitTimeout,
+		clientPeers:   addressesByID(cfg.ClientPeers),
 		closedCh:      make(chan struct{}),
+	}
+	if cfg.ClientAddress != "" {
+		s.clientPeers[cfg.ID] = cfg.ClientAddress
 	}
 
 	applyCh := make(chan raft.ApplyMsg, cfg.ApplyBuffer)
@@ -114,6 +126,19 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if cfg.RaftAddress == "" {
 		return cfg, fmt.Errorf("raft address must be set")
 	}
+	if len(cfg.ClientPeers) > 0 && len(cfg.ClientPeers) != len(cfg.Peers) {
+		return cfg, fmt.Errorf("client peer count (%d) must match peer count (%d)", len(cfg.ClientPeers), len(cfg.Peers))
+	}
+	if cfg.ClientAddress == "" && cfg.ID < len(cfg.ClientPeers) {
+		cfg.ClientAddress = strings.TrimSpace(cfg.ClientPeers[cfg.ID])
+	}
+	if len(cfg.ClientPeers) == 0 && len(cfg.Peers) > 0 && cfg.ClientAddress != "" {
+		derived, err := deriveClientPeerAddresses(cfg.Peers, cfg.RaftAddress, cfg.ClientAddress)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.ClientPeers = derived
+	}
 	if cfg.StoreDir == "" {
 		cfg.StoreDir = fmt.Sprintf("kvstore_%d", cfg.ID)
 	}
@@ -128,6 +153,57 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	cfg.StoreOptions.ReadWrite = true
 	return cfg, nil
+}
+
+func deriveClientPeerAddresses(raftPeers []string, raftAddress, clientAddress string) ([]string, error) {
+	_, raftPortText, err := net.SplitHostPort(raftAddress)
+	if err != nil {
+		return nil, fmt.Errorf("parse raft address %q: %w", raftAddress, err)
+	}
+	raftPort, err := strconv.Atoi(raftPortText)
+	if err != nil {
+		return nil, fmt.Errorf("parse raft port %q: %w", raftPortText, err)
+	}
+
+	_, clientPortText, err := net.SplitHostPort(clientAddress)
+	if err != nil {
+		return nil, fmt.Errorf("parse client address %q: %w", clientAddress, err)
+	}
+	clientPort, err := strconv.Atoi(clientPortText)
+	if err != nil {
+		return nil, fmt.Errorf("parse client port %q: %w", clientPortText, err)
+	}
+
+	offset := clientPort - raftPort
+	clientPeers := make([]string, len(raftPeers))
+	for i, peer := range raftPeers {
+		host, peerPortText, err := net.SplitHostPort(strings.TrimSpace(peer))
+		if err != nil {
+			return nil, fmt.Errorf("parse peer address %q: %w", peer, err)
+		}
+		peerPort, err := strconv.Atoi(peerPortText)
+		if err != nil {
+			return nil, fmt.Errorf("parse peer port %q: %w", peerPortText, err)
+		}
+		clientPeerPort := peerPort + offset
+		if clientPeerPort <= 0 {
+			return nil, fmt.Errorf("derived invalid client port %d from peer %q", clientPeerPort, peer)
+		}
+		clientPeers[i] = net.JoinHostPort(host, strconv.Itoa(clientPeerPort))
+	}
+	return clientPeers, nil
+}
+
+func addressesByID(addresses []string) map[int]string {
+	byID := make(map[int]string, len(addresses))
+	for i, address := range addresses {
+		address = strings.TrimSpace(address)
+		if address == "" {
+			continue
+		}
+		byID[i] = address
+	}
+	return byID
 }
 
 func (s *RaftKVServer) Start() error {
@@ -272,6 +348,32 @@ func (s *RaftKVServer) IsLeader() bool {
 	return s.raftNode.IsLeader()
 }
 
+func (s *RaftKVServer) leaderAddress() string {
+	if s.raftNode == nil {
+		return ""
+	}
+
+	leaderID := s.raftNode.LeaderID()
+	if leaderID < 0 {
+		return ""
+	}
+	if address, ok := s.clientPeers[leaderID]; ok {
+		return address
+	}
+	if leaderID == s.id {
+		return s.clientAddress
+	}
+	return ""
+}
+
+func (s *RaftKVServer) errorResponse(err error) *pb.KVResponse {
+	resp := &pb.KVResponse{Success: false, Error: err.Error()}
+	if errors.Is(err, ErrNotLeader) {
+		resp.Leader = s.leaderAddress()
+	}
+	return resp
+}
+
 func (s *RaftKVServer) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closedCh)
@@ -339,21 +441,21 @@ type GRPCKVService struct {
 func (g *GRPCKVService) Get(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
 	value, err := g.server.Get(ctx, req.Key)
 	if err != nil {
-		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
+		return g.server.errorResponse(err), nil
 	}
 	return &pb.KVResponse{Success: true, Value: string(value)}, nil
 }
 
 func (g *GRPCKVService) Put(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
 	if err := g.server.Put(req.Key, req.Value); err != nil {
-		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
+		return g.server.errorResponse(err), nil
 	}
 	return &pb.KVResponse{Success: true}, nil
 }
 
 func (g *GRPCKVService) Delete(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
 	if err := g.server.Delete(req.Key); err != nil {
-		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
+		return g.server.errorResponse(err), nil
 	}
 	return &pb.KVResponse{Success: true}, nil
 }
@@ -421,6 +523,11 @@ func (s *RaftKVServer) StartClientListener(clientPort string) error {
 	if err != nil {
 		return err
 	}
+	s.clientAddress = clientPort
+	if s.clientPeers == nil {
+		s.clientPeers = make(map[int]string)
+	}
+	s.clientPeers[s.id] = clientPort
 	s.clientLn = listener
 	s.clientGRPC = grpc.NewServer()
 	pb.RegisterKVServiceServer(s.clientGRPC, &GRPCKVService{server: s})

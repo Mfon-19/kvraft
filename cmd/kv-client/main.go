@@ -92,7 +92,7 @@ func main() {
 			} else {
 				fmt.Printf("✗ Error: %s\n", resp.Error)
 				if resp.Error == "not leader" {
-					fmt.Println("  (Try connecting to a different node)")
+					printLeaderHint(resp.Leader)
 				}
 			}
 		case "get":
@@ -110,7 +110,7 @@ func main() {
 			} else {
 				fmt.Printf("✗ Error: %s\n", resp.Error)
 				if resp.Error == "not leader" {
-					fmt.Println("  (Try connecting to a different node)")
+					printLeaderHint(resp.Leader)
 				}
 			}
 		case "delete":
@@ -128,7 +128,7 @@ func main() {
 			} else {
 				fmt.Printf("✗ Error: %s\n", resp.Error)
 				if resp.Error == "not leader" {
-					fmt.Println("  (Try connecting to a different node)")
+					printLeaderHint(resp.Leader)
 				}
 			}
 		default:
@@ -146,4 +146,12 @@ func invoke(client pb.KVServiceClient, req common.ClientRequest) (common.ClientR
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return common.InvokeKV(ctx, client, req)
+}
+
+func printLeaderHint(leader string) {
+	if leader == "" {
+		fmt.Println("  (Try connecting to a different node)")
+		return
+	}
+	fmt.Printf("  (Leader hint: %s)\n", leader)
 }

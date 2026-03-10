@@ -13,8 +13,9 @@ type Node struct {
 	shutdownOnce sync.Once
 
 	// server identity and peer addresses
-	id    int
-	peers []string
+	id       int
+	peers    []string
+	leaderID int
 
 	// persistent state for each raft node
 	currentTerm int
@@ -56,6 +57,7 @@ func NewNode(id int, peers []string, applyCh chan ApplyMsg, rpcHandler RPCHandle
 	n := &Node{
 		id:                 id,
 		peers:              peers,
+		leaderID:           -1,
 		currentTerm:        0,
 		votedFor:           -1,
 		log:                make([]LogEntry, 1),
@@ -139,6 +141,7 @@ func (n *Node) runCandidate() {
 	// increase current term and vote for self.
 	n.currentTerm++
 	n.votedFor = n.id
+	n.leaderID = -1
 	currentTerm := n.currentTerm
 	lastLogIndex := len(n.log) - 1
 	lastLogTerm := n.log[lastLogIndex].Term
@@ -233,6 +236,7 @@ func (n *Node) runLeader() {
 
 func (n *Node) becomeLeaderLocked() {
 	n.state = Leader
+	n.leaderID = n.id
 	n.nextIndex = make(map[int]int, len(n.peers))
 	n.matchIndex = make(map[int]int, len(n.peers))
 
@@ -250,6 +254,7 @@ func (n *Node) becomeFollowerLocked(term int) {
 	}
 	n.votedFor = -1
 	n.state = Follower
+	n.leaderID = -1
 }
 
 func (n *Node) replicationWorker(peerIdx int, peerAddr string, trigger <-chan struct{}) {
@@ -483,6 +488,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 
 	if args.Term >= n.currentTerm {
 		n.becomeFollowerLocked(args.Term)
+		n.leaderID = args.LeaderId
 	}
 
 	select {
@@ -548,6 +554,12 @@ func (n *Node) GetState() (int, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.currentTerm, n.state == Leader
+}
+
+func (n *Node) LeaderID() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.leaderID
 }
 
 func (n *Node) Shutdown() {

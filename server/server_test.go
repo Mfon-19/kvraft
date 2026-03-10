@@ -41,6 +41,7 @@ func newBareServer(t *testing.T) *RaftKVServer {
 type mockRaftBackend struct {
 	submitFn        func(cmd raft.Command) (int, int, bool)
 	isLeaderFn      func() bool
+	leaderIDFn      func() int
 	requestVoteFn   func(args *raft.RequestVoteArgs, reply *raft.RequestVoteReply)
 	appendEntriesFn func(args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply)
 	shutdownFn      func()
@@ -72,6 +73,13 @@ func (m *mockRaftBackend) IsLeader() bool {
 	return false
 }
 
+func (m *mockRaftBackend) LeaderID() int {
+	if m.leaderIDFn != nil {
+		return m.leaderIDFn()
+	}
+	return -1
+}
+
 func (m *mockRaftBackend) Shutdown() {
 	if m.shutdownFn != nil {
 		m.shutdownFn()
@@ -80,7 +88,10 @@ func (m *mockRaftBackend) Shutdown() {
 
 func TestGRPCKVGetNotLeader(t *testing.T) {
 	s := newBareServer(t)
-	s.raftNode = &mockRaftBackend{}
+	s.clientPeers = map[int]string{1: "localhost:8001"}
+	s.raftNode = &mockRaftBackend{
+		leaderIDFn: func() int { return 1 },
+	}
 	api := &GRPCKVService{server: s}
 
 	resp, err := api.Get(context.Background(), &pb.KVRequest{Key: "missing"})
@@ -89,6 +100,9 @@ func TestGRPCKVGetNotLeader(t *testing.T) {
 	}
 	if resp.Success || resp.Error != ErrNotLeader.Error() {
 		t.Fatalf("expected not-leader get response, got %+v", resp)
+	}
+	if resp.Leader != "localhost:8001" {
+		t.Fatalf("expected leader hint localhost:8001, got %+v", resp)
 	}
 }
 
@@ -153,6 +167,10 @@ func TestPutDeleteReturnNotLeader(t *testing.T) {
 
 func TestGRPCKVPutDeleteNotLeader(t *testing.T) {
 	s := newBareServer(t)
+	s.clientPeers = map[int]string{2: "localhost:8002"}
+	s.raftNode = &mockRaftBackend{
+		leaderIDFn: func() int { return 2 },
+	}
 	api := &GRPCKVService{server: s}
 
 	putResp, err := api.Put(context.Background(), &pb.KVRequest{Key: "k", Value: "v"})
@@ -162,6 +180,9 @@ func TestGRPCKVPutDeleteNotLeader(t *testing.T) {
 	if putResp.Success || putResp.Error != ErrNotLeader.Error() {
 		t.Fatalf("expected not-leader put response, got %+v", putResp)
 	}
+	if putResp.Leader != "localhost:8002" {
+		t.Fatalf("expected leader hint localhost:8002 on put, got %+v", putResp)
+	}
 
 	delResp, err := api.Delete(context.Background(), &pb.KVRequest{Key: "k"})
 	if err != nil {
@@ -169,6 +190,28 @@ func TestGRPCKVPutDeleteNotLeader(t *testing.T) {
 	}
 	if delResp.Success || delResp.Error != ErrNotLeader.Error() {
 		t.Fatalf("expected not-leader delete response, got %+v", delResp)
+	}
+	if delResp.Leader != "localhost:8002" {
+		t.Fatalf("expected leader hint localhost:8002 on delete, got %+v", delResp)
+	}
+}
+
+func TestNormalizeConfigDerivesClientPeerAddresses(t *testing.T) {
+	cfg, err := normalizeConfig(Config{
+		ID:            1,
+		RaftAddress:   "localhost:6001",
+		ClientAddress: "localhost:8001",
+		Peers:         []string{"localhost:6000", "localhost:6001", "localhost:6002"},
+	})
+	if err != nil {
+		t.Fatalf("normalizeConfig returned err: %v", err)
+	}
+
+	expected := []string{"localhost:8000", "localhost:8001", "localhost:8002"}
+	for i, addr := range expected {
+		if cfg.ClientPeers[i] != addr {
+			t.Fatalf("expected client peer %d to be %q, got %q", i, addr, cfg.ClientPeers[i])
+		}
 	}
 }
 

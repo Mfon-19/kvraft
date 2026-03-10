@@ -24,6 +24,7 @@ func main() {
 	port := flag.Int("port", 6000, "Raft RPC port")
 	clientPort := flag.Int("client-port", 8000, "Client request port")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peer addresses (e.g., localhost:5001,localhost:5002)")
+	clientPeersFlag := flag.String("client-peers", "", "Comma-separated list of client addresses aligned with -peers (e.g., localhost:8000,localhost:8001)")
 	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "Log format: text|json")
 	showVersion := flag.Bool("version", false, "Print version and exit")
@@ -48,16 +49,22 @@ func main() {
 	if *peersFlag != "" {
 		peers = strings.Split(*peersFlag, ",")
 	}
+	var clientPeers []string
+	if *clientPeersFlag != "" {
+		clientPeers = strings.Split(*clientPeersFlag, ",")
+	}
 
 	address := fmt.Sprintf("localhost:%d", *port)
 	clientAddress := fmt.Sprintf("localhost:%d", *clientPort)
 
-	slog.Info("starting raft-kv node", "id", *id, "raft_address", address, "client_address", clientAddress, "peers", peers)
+	slog.Info("starting raft-kv node", "id", *id, "raft_address", address, "client_address", clientAddress, "peers", peers, "client_peers", clientPeers)
 
 	srv, err := server.NewRaftKVServer(server.Config{
-		ID:          *id,
-		RaftAddress: address,
-		Peers:       peers,
+		ID:            *id,
+		RaftAddress:   address,
+		ClientAddress: clientAddress,
+		Peers:         peers,
+		ClientPeers:   clientPeers,
 	})
 	if err != nil {
 		slog.Error("failed to construct raft server", "error", err)
