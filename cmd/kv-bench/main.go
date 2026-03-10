@@ -387,7 +387,7 @@ func runRaftBenchmark(addresses []string, writes, payloadBytes, consistencySampl
 		samples = len(keys)
 	}
 	for _, key := range keys[len(keys)-samples:] {
-		if err := waitForReplication(addresses, key, expected[key], 4*time.Second); err != nil {
+		if _, err := waitForCommittedRead(addresses, leader, key, expected[key], 4*time.Second); err != nil {
 			failureCount++
 		}
 	}
@@ -406,7 +406,7 @@ func runRaftBenchmark(addresses []string, writes, payloadBytes, consistencySampl
 		LatencySamplesMS:    sorted,
 	}
 	if failureCount > 0 {
-		result.ConsistencyErrorText = fmt.Sprintf("%d keys did not converge to the expected value on all nodes", failureCount)
+		result.ConsistencyErrorText = fmt.Sprintf("%d keys were not readable with the expected value from the leader within the timeout", failureCount)
 	}
 	return result, nil
 }
@@ -479,25 +479,31 @@ func putWithRetryPersistent(addresses []string, leader *string, client **persist
 	return 0, "", fmt.Errorf("put failed after retries")
 }
 
-func waitForReplication(addresses []string, key, expected string, timeout time.Duration) error {
+func waitForCommittedRead(addresses []string, leaderHint, key, expected string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
+	leader := leaderHint
 
 	for time.Now().Before(deadline) {
-		allMatch := true
-		for _, addr := range addresses {
-			resp, _, err := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: key}, 1200*time.Millisecond)
-			if err != nil || !resp.Success || resp.Value != expected {
-				allMatch = false
-				break
+		if leader == "" {
+			discovered, err := discoverLeader(addresses, 2*time.Second)
+			if err != nil {
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
+			leader = discovered
 		}
-		if allMatch {
-			return nil
+
+		resp, _, err := sendRequest(leader, common.ClientRequest{Type: common.OpGet, Key: key}, 1200*time.Millisecond)
+		if err == nil && resp.Success && resp.Value == expected {
+			return leader, nil
+		}
+		if err != nil || benchworkload.IsNotLeader(resp.Error) {
+			leader = ""
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	return fmt.Errorf("replication timeout for key %s", key)
+	return leader, fmt.Errorf("leader visibility timeout for key %s", key)
 }
 
 func sendRequest(address string, req common.ClientRequest, timeout time.Duration) (common.ClientResponse, time.Duration, error) {
@@ -783,9 +789,11 @@ func preloadReadDataset(addresses []string, leaderHint string, keyCount, payload
 		samples = len(keys)
 	}
 	for _, key := range keys[len(keys)-samples:] {
-		if err := waitForReplication(addresses, key, benchworkload.FixedPayload(payloadBytes, uint64(parseHexKey(key))), 4*time.Second); err != nil {
+		leaderOut, err := waitForCommittedRead(addresses, leader, key, benchworkload.FixedPayload(payloadBytes, uint64(parseHexKey(key))), 4*time.Second)
+		if err != nil {
 			return nil, "", err
 		}
+		leader = leaderOut
 	}
 
 	return keys, leader, nil
@@ -879,7 +887,7 @@ func executeLoadOperation(pool *workerClientPool, cfg loadScenarioConfig, leader
 	case loadModeReadAllMembers:
 		key := cfg.ReadKeys[rng.Intn(len(cfg.ReadKeys))]
 		target := cfg.Addresses[rng.Intn(len(cfg.Addresses))]
-		return readTarget(pool, target, key)
+		return readAllMembers(pool, cfg.Addresses, leaderRef, target, key)
 	default:
 		return false
 	}
@@ -951,9 +959,17 @@ func readLeader(pool *workerClientPool, addresses []string, leaderRef *atomic.Va
 	return false
 }
 
-func readTarget(pool *workerClientPool, target, key string) bool {
-	resp, err := pool.request(target, common.ClientRequest{Type: common.OpGet, Key: key})
-	return err == nil && resp.Success
+func readAllMembers(pool *workerClientPool, addresses []string, leaderRef *atomic.Value, firstTarget, key string) bool {
+	resp, err := pool.request(firstTarget, common.ClientRequest{Type: common.OpGet, Key: key})
+	if err == nil && resp.Success {
+		leaderRef.Store(firstTarget)
+		return true
+	}
+	if err != nil || benchworkload.IsNotLeader(resp.Error) {
+		leaderRef.Store("")
+		return readLeader(pool, addresses, leaderRef, key)
+	}
+	return false
 }
 
 func runLightLoadProbe(addresses []string, leader string, payloadBytes, ops int) (latencySummary, latencySummary, error) {

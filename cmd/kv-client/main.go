@@ -109,6 +109,9 @@ func main() {
 				fmt.Printf("%s\n", resp.Value)
 			} else {
 				fmt.Printf("✗ Error: %s\n", resp.Error)
+				if resp.Error == "not leader" {
+					fmt.Println("  (Try connecting to a different node)")
+				}
 			}
 		case "delete":
 			if len(parts) != 2 {

@@ -15,7 +15,7 @@ Raft is a consensus algorithm that keeps replicas in a consistent state by elect
 - Consensus: Raft leader election and log replication over gRPC.
 - Storage: Bitcask v2 engine with append-only `.data` segments, `.hint` files, CRC validation, tombstones, merge compaction, and single-writer locking.
 - API: gRPC `KVService` (`Get`, `Put`, `Delete`) for clients and gRPC Raft RPCs (`RequestVote`, `AppendEntries`) for inter-node communication.
-- Execution model: writes are acknowledged after quorum replication and state-machine apply; reads are served from local Bitcask keydir + single-seek data fetch.
+- Execution model: writes are acknowledged after quorum replication and state-machine apply; linearizable reads are served by the leader after a replicated read barrier commits, then read from the local Bitcask keydir.
 
 ## Releases
 
@@ -32,6 +32,8 @@ Version check:
 ## Benchmark Methodology
 
 Benchmarks are run by `cmd/kv-bench`, which launches an isolated 3-node cluster and captures machine-generated JSON output.
+
+The snapshot below reflects a local run on March 10, 2026 using the flags shown here.
 
 ```bash
 go build -o kv-server ./cmd/kv-server
@@ -72,38 +74,38 @@ go run ./cmd/kv-bench \
 
 ### Core project checks
 
-- Raft write p99 latency: **0.52 ms** (target `<10 ms`)
-- Restart time (merged+hints median): **21.30 ms**
-- Disk reduction after merge: **50.17%** (just above the configured 50% upper bound)
+- Raft write p99 latency: **0.72 ms** (target `<10 ms`)
+- Restart time (merged+hints median): **40.55 ms**
+- Disk reduction after merge: **50.17%** (slightly above the configured 50% upper bound)
 
 ### etcd-style workload comparison 
 
 | Scenario | etcd reference target | Raft-KV measured | Result |
 |---|---:|---:|---|
-| Heavy write throughput (leader-targeted) | 44,000 req/s | 17,106 req/s | miss |
-| Heavy write avg latency (leader-targeted) | 22 ms | 3.30 ms | pass |
-| Heavy write throughput (all-members target) | 50,000 req/s | 14,317 req/s | miss |
-| Heavy write avg latency (all-members target) | 20 ms | 3.76 ms | pass |
-| Heavy read throughput (linearizable) | 141,000 req/s | 121,259 req/s | miss |
-| Heavy read avg latency (linearizable) | 5.5 ms | 0.79 ms | pass |
-| Heavy read throughput (serializable) | 186,000 req/s | 89,742 req/s | miss |
-| Heavy read avg latency (serializable) | 2.2 ms | 1.07 ms | pass |
-| Light-load `Put` avg latency | <1 ms | 0.256 ms | pass |
-| Light-load `Get` avg latency | <1 ms | 0.114 ms | pass |
-| WAL fsync p99 proxy | <10 ms | 6.68 ms | pass |
-| Backend commit p99 proxy | <25 ms | 5.13 ms | pass |
+| Heavy write throughput (leader-targeted) | 44,000 req/s | 37,871 req/s | miss |
+| Heavy write avg latency (leader-targeted) | 22 ms | 1.69 ms | pass |
+| Heavy write throughput (all-members target) | 50,000 req/s | 24,206 req/s | miss |
+| Heavy write avg latency (all-members target) | 20 ms | 2.64 ms | pass |
+| Heavy read throughput (linearizable) | 141,000 req/s | 41,212 req/s | miss |
+| Heavy read avg latency (linearizable) | 5.5 ms | 2.33 ms | pass |
+| Heavy read throughput (serializable) | 186,000 req/s | 5,896 req/s | miss |
+| Heavy read avg latency (serializable) | 2.2 ms | 16.27 ms | miss |
+| Light-load `Put` avg latency | <1 ms | 0.349 ms | pass |
+| Light-load `Get` avg latency | <1 ms | 0.340 ms | pass |
+| WAL fsync p99 proxy | <10 ms | 1.65 ms | pass |
+| Backend commit p99 proxy | <25 ms | 1.55 ms | pass |
 
 `etcdctl check perf` style gates:
-- `small`: fail
-- `medium`: fail
+- `small`: pass
+- `medium`: pass
 - `large`: fail
 - `xlarge`: fail
 
 ## Interpreting the Numbers
 
-- The current implementation is **latency-strong** across write and read paths, and meets the local fsync durability SLO proxies.
+- The current implementation is **latency-strong** on leader-targeted writes and leader-served linearizable reads, and it meets the local fsync durability SLO proxies.
 - The system remains below etcd's published heavy-load throughput references on this hardware and topology.
-- `check perf` failures in this run are driven by high slowest-request outliers, which points to tail-latency spikes under stress rather than low average performance.
+- The remaining `check perf` failures in this run are driven by high slowest-request outliers at larger worker counts, which points to tail-latency spikes under stress rather than weak average latency.
 
 ## Comparison Notes vs etcd
 
@@ -113,7 +115,8 @@ The etcd targets come from published etcd operational/performance references:
 
 Important caveats for fair comparison:
 - This project is a focused educational/portfolio implementation, not a feature-complete etcd replacement.
-- The current “linearizable” read benchmark is leader-targeted read behavior in this implementation, not etcd ReadIndex semantics.
+- Linearizable reads in this implementation are leader-only and ordered by a replicated read barrier rather than etcd's ReadIndex path.
+- The current "serializable" benchmark name is historical: with follower reads now rejecting and clients retrying through the leader, this path is no longer measuring follower-local stale reads.
 - Results are environment-sensitive (CPU, disk class, kernel, network stack, background load).
 
 ## Repository Layout

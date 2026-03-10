@@ -66,20 +66,21 @@ func main() {
 	}
 	log.Println("\t✓ Basic Put/Get passed")
 
-	log.Println("[3/10] Verifying Replication...")
-	time.Sleep(10 * time.Second)
-
-	successCount := 0
+	log.Println("[3/10] Verifying Leader-Only Linearizable Reads...")
+	rejectedFollowers := 0
 	for _, addr := range addresses {
+		if addr == leaderAddr {
+			continue
+		}
 		resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
-		if resp.Success && resp.Value == "bar" {
-			successCount++
+		if !resp.Success && resp.Error == "not leader" {
+			rejectedFollowers++
 		}
 	}
-	if successCount < 2 {
-		log.Fatalf("\t✗ Replication failed. Only %d/3 nodes have data.", successCount)
+	if rejectedFollowers != len(addresses)-1 {
+		log.Fatalf("\t✗ Expected follower reads to be rejected, got %d/%d rejections.", rejectedFollowers, len(addresses)-1)
 	}
-	log.Printf("\t✓ Data present on %d/3 nodes", successCount)
+	log.Println("\t✓ Followers rejected linearizable reads")
 
 	log.Println("[4/10] Sequential Writes...")
 	for i := 0; i < 5; i++ {
@@ -106,15 +107,17 @@ func main() {
 	}
 	log.Println("\t✓ Key deleted")
 
-	log.Println("[7/10] Verifying Delete Replication...")
-	time.Sleep(600 * time.Millisecond)
+	log.Println("[7/10] Verifying Followers Still Reject Reads...")
 	for _, addr := range addresses {
+		if addr == leaderAddr {
+			continue
+		}
 		resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: "foo"})
-		if resp.Success {
-			log.Fatalf("\t✗ Node %s still has deleted key", addr)
+		if resp.Success || resp.Error != "not leader" {
+			log.Fatalf("\t✗ Expected follower %s to reject read, got %+v", addr, resp)
 		}
 	}
-	log.Println("\t✓ Delete replicated to all nodes")
+	log.Println("\t✓ Followers continued to reject linearizable reads")
 
 	log.Println("[8/10] Testing Follower Rejection...")
 	checkedFollower := false
@@ -146,23 +149,29 @@ func main() {
 	duration := time.Since(start)
 	log.Printf("\t✓ %d/%d writes succeeded in %v (%.0f req/sec)", ok, total, duration, float64(ok)/duration.Seconds())
 
-	log.Println("[10/10] Final Consistency Check...")
+	log.Println("[10/10] Final Linearizable Read Check...")
 	time.Sleep(1 * time.Second)
 
 	testKey := "bench-99"
-	consistent := 0
+	resp, err = sendRequest(leaderAddr, common.ClientRequest{Type: common.OpGet, Key: testKey})
+	if err != nil || !resp.Success || resp.Value != "x" {
+		log.Fatalf("\t✗ Leader read failed. Response=%+v err=%v", resp, err)
+	}
+	rejectedFollowers = 0
 	for _, addr := range addresses {
+		if addr == leaderAddr {
+			continue
+		}
 		resp, _ := sendRequest(addr, common.ClientRequest{Type: common.OpGet, Key: testKey})
-		if resp.Success && resp.Value == "x" {
-			consistent++
+		if !resp.Success && resp.Error == "not leader" {
+			rejectedFollowers++
 		}
 	}
 
-	if consistent >= 2 {
-		log.Printf("\t✓ Consistency verified (%d nodes match)", consistent)
-	} else {
-		log.Fatalf("\t✗ Cluster inconsistent. Only %d nodes match.", consistent)
+	if rejectedFollowers != len(addresses)-1 {
+		log.Fatalf("\t✗ Expected follower read rejection, got %d/%d rejections.", rejectedFollowers, len(addresses)-1)
 	}
+	log.Println("\t✓ Leader served the read and followers rejected it")
 
 	log.Println("\n--- All Tests Passed Successfully ---")
 }

@@ -22,6 +22,9 @@ var (
 	ErrServerClosed  = errors.New("server closed")
 )
 
+const commandTypeReadBarrier = "read_barrier"
+const maxCompletedNotifications = 1024
+
 type Config struct {
 	ID          int
 	RaftAddress string
@@ -39,11 +42,19 @@ type pendingKey struct {
 	term  int
 }
 
+type raftBackend interface {
+	HandleRequestVote(args *raft.RequestVoteArgs, reply *raft.RequestVoteReply)
+	HandleAppendEntries(args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply)
+	Submit(cmd raft.Command) (int, int, bool)
+	IsLeader() bool
+	Shutdown()
+}
+
 type RaftKVServer struct {
 	id      int
 	address string
 
-	raftNode *raft.Node
+	raftNode raftBackend
 	store    *kvstore.DB
 
 	grpcServer *grpc.Server
@@ -53,6 +64,8 @@ type RaftKVServer struct {
 
 	pendingLock sync.Mutex
 	pending     map[pendingKey]chan error
+	completed   map[pendingKey]error
+	completionQ []pendingKey
 
 	commitTimeout time.Duration
 	closedCh      chan struct{}
@@ -76,6 +89,7 @@ func NewRaftKVServer(cfg Config) (*RaftKVServer, error) {
 		address:       cfg.RaftAddress,
 		store:         open,
 		pending:       make(map[pendingKey]chan error),
+		completed:     make(map[pendingKey]error),
 		commitTimeout: cfg.CommitTimeout,
 		closedCh:      make(chan struct{}),
 	}
@@ -148,6 +162,9 @@ func (s *RaftKVServer) applyCommittedEntries(applyCh <-chan raft.ApplyMsg) {
 				applyErr = s.store.Put(msg.Command.Key, msg.Command.Value)
 			case "delete":
 				applyErr = s.store.Delete(msg.Command.Key)
+			case commandTypeReadBarrier:
+				// Replicated read barriers do not mutate state; they only order reads
+				// after the leader has committed and applied all prior entries.
 			}
 
 			key := pendingKey{index: msg.Index, term: msg.Term}
@@ -155,13 +172,27 @@ func (s *RaftKVServer) applyCommittedEntries(applyCh <-chan raft.ApplyMsg) {
 			if ch, ok := s.pending[key]; ok {
 				ch <- applyErr
 				delete(s.pending, key)
+			} else {
+				if len(s.completionQ) >= maxCompletedNotifications {
+					evict := s.completionQ[0]
+					s.completionQ = s.completionQ[1:]
+					delete(s.completed, evict)
+				}
+				s.completed[key] = applyErr
+				s.completionQ = append(s.completionQ, key)
 			}
 			s.pendingLock.Unlock()
 		}
 	}
 }
 
-func (s *RaftKVServer) Get(key string) ([]byte, error) {
+func (s *RaftKVServer) Get(ctx context.Context, key string) ([]byte, error) {
+	ctx, cancel := s.withCommitTimeout(ctx)
+	defer cancel()
+
+	if err := s.submitAndWait(ctx, raft.Command{Type: commandTypeReadBarrier}); err != nil {
+		return nil, err
+	}
 	return s.store.Get(key)
 }
 
@@ -177,7 +208,21 @@ func (s *RaftKVServer) Delete(key string) error {
 	return s.submitAndWait(ctx, raft.Command{Type: "delete", Key: key})
 }
 
+func (s *RaftKVServer) withCommitTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), s.commitTimeout)
+	}
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.commitTimeout)
+}
+
 func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd raft.Command) error {
+	if s.raftNode == nil {
+		return ErrNotLeader
+	}
+
 	index, term, isLeader := s.raftNode.Submit(cmd)
 	if !isLeader {
 		return ErrNotLeader
@@ -192,6 +237,11 @@ func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd raft.Command) erro
 		s.pendingLock.Unlock()
 		return ErrServerClosed
 	default:
+	}
+	if err, ok := s.completed[waitKey]; ok {
+		delete(s.completed, waitKey)
+		s.pendingLock.Unlock()
+		return err
 	}
 	s.pending[waitKey] = waitCh
 	s.pendingLock.Unlock()
@@ -216,6 +266,9 @@ func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd raft.Command) erro
 }
 
 func (s *RaftKVServer) IsLeader() bool {
+	if s.raftNode == nil {
+		return false
+	}
 	return s.raftNode.IsLeader()
 }
 
@@ -284,7 +337,7 @@ type GRPCKVService struct {
 }
 
 func (g *GRPCKVService) Get(ctx context.Context, req *pb.KVRequest) (*pb.KVResponse, error) {
-	value, err := g.server.Get(req.Key)
+	value, err := g.server.Get(ctx, req.Key)
 	if err != nil {
 		return &pb.KVResponse{Success: false, Error: err.Error()}, nil
 	}
